@@ -17,10 +17,9 @@ Every instruction states where it is performed:
 | Label | Where to perform it |
 |---|---|
 | **Cloudflare dashboard** | Cloudflare zone for `cockxing.online`; used only for DNS records in this design |
-| **Google Cloud Console** | Google Cloud Console pages for Compute Engine, IAM, and VPC firewall rules |
-| **Google Cloud Shell** | Cloud Shell opened from the Google Cloud Console; used for the `gcloud` provisioning commands |
-| **Administrator workstation** | Administrator's local terminal with Google Cloud CLI authenticated to the project; used to open the OS Login SSH session |
-| **Origin SSH terminal** | SSH session to the Ubuntu VM, signed in as a sudo-capable deployment user |
+| **Akamai Cloud Manager** | Akamai Cloud web console; used for account, region, reserved IP, and firewall review |
+| **Administrator workstation** | Administrator's local terminal with the Linode CLI authenticated to the Akamai Cloud account; used for provisioning and SSH |
+| **Origin SSH terminal** | SSH session to the Ubuntu VM, signed in as root initially or as a sudo-capable deployment user |
 | **Bunny dashboard** | `https://panel.bunny.net/` |
 | **vMix PC** | Windows computer running vMix |
 | **External test device** | A network other than the origin VM; ideally test locations in each target region |
@@ -45,72 +44,41 @@ At 3,000 Kbps video plus 128 Kbps audio, one continuous viewer transfers about *
 
 Calculate the expected bill from the expected traffic share in each region. For an even four-region split, the baseline is about **$36,540/month**. Verify live pricing before committing; Bunny Volume is cheaper but has fewer PoPs and needs audience testing.
 
-## 2. Create the Google Cloud origin VM
+## 2. Create the Akamai origin VM
 
-### 2.1 Select the Google Cloud region and secure administrator access
+### 2.1 Select the Akamai region and secure administrator access
 
-**Location: Google Cloud Console. No command is required.**
+**Location: Akamai Cloud Manager and Administrator workstation.**
 
-1. Select the Google Cloud project that will own the origin. Record its project ID.
-2. Choose a Compute Engine region nearest the vMix PC, then choose a zone in that region. Example: `asia-southeast1` and `asia-southeast1-a`. The example values below must be replaced with your chosen region and zone.
-3. Enable **OS Login** for the instance and grant each administrator `roles/compute.osAdminLogin`. OS Login ties SSH access to Google IAM rather than persistent metadata SSH keys.
-4. If your organization supports it, enable OS Login two-step verification. Ensure every administrator has Google two-step verification configured before enforcing it.
+1. Select the Akamai Cloud account that will own the origin.
+2. Choose an Akamai Cloud region nearest the vMix PC. Example: `ap-south` for Singapore. The example value below must be replaced with the region you choose.
+3. Create or select an SSH key pair for the administrator. The public key is installed on the VM during provisioning.
+4. Install and authenticate the Linode CLI if it is not already configured:
+
+```bash
+linode-cli configure
+```
+
 5. Determine and record the public IPv4 addresses/CIDR ranges for the administrator workstation and the vMix site.
 
-### 2.2 Reserve the static public IP and create the VM
+### 2.2 Create the Akamai Cloud Firewall and VM
 
-**Location: Google Cloud Shell. Working directory: Cloud Shell home directory.**
+**Location: Administrator workstation. Working directory: home directory (`~`).**
 
-1. Open Cloud Shell and set the following variables. Replace every all-uppercase placeholder before executing.
+1. Set the following variables. Replace every all-uppercase placeholder before executing.
 
 ```bash
-PROJECT_ID="YOUR_GOOGLE_CLOUD_PROJECT_ID"
-REGION="YOUR_REGION"
-ZONE="YOUR_ZONE"
-NETWORK="default"
+REGION="YOUR_AKAMAI_REGION"
 INSTANCE="ome-origin01"
 TAG="ome-origin"
+TYPE="g6-standard-2"
+IMAGE="linode/ubuntu24.04"
+SSH_PUBLIC_KEY="$HOME/.ssh/id_ed25519.pub"
 ADMIN_CIDR="YOUR_ADMIN_PUBLIC_IP/32"
 VMIX_CIDR="YOUR_VMIX_PUBLIC_IP/32"
-gcloud config set project "$PROJECT_ID"
 ```
 
-2. Reserve a regional static IPv4 address. This prevents a VM restart from changing the origin address.
-
-```bash
-gcloud compute addresses create ome-origin01-ip --region="$REGION"
-gcloud compute addresses describe ome-origin01-ip --region="$REGION" --format='get(address)'
-```
-
-3. Create the VM. `e2-medium` provides 2 vCPU and 4 GB RAM; increase capacity after load testing. The VM has no attached service account because this deployment does not require access to Google APIs from inside the VM.
-
-```bash
-gcloud compute instances create "$INSTANCE" \
-  --zone="$ZONE" \
-  --machine-type="e2-medium" \
-  --image-family="ubuntu-2404-lts-amd64" \
-  --image-project="ubuntu-os-cloud" \
-  --boot-disk-size="50GB" \
-  --boot-disk-type="pd-balanced" \
-  --address="ome-origin01-ip" \
-  --tags="$TAG" \
-  --metadata="enable-oslogin=TRUE" \
-  --no-service-account \
-  --no-scopes
-```
-
-4. Confirm that the instance is running and note its fixed external IP:
-
-```bash
-gcloud compute instances describe "$INSTANCE" --zone="$ZONE" \
-  --format='get(status,networkInterfaces[0].accessConfigs[0].natIP)'
-```
-
-### 2.3 Create Google Cloud VPC firewall rules
-
-**Location: Google Cloud Shell. Working directory: Cloud Shell home directory.**
-
-1. Create target-tagged rules. Only this VM is affected because it has the `ome-origin` network tag.
+2. Create an Akamai Cloud Firewall. The inbound default is drop, so only SSH, HTTPS setup traffic, HTTPS playback origin traffic, and SRT ingest are allowed.
 
 | Rule | Source | Action |
 |---|---|---|
@@ -121,28 +89,48 @@ gcloud compute instances describe "$INSTANCE" --zone="$ZONE" \
 | Any other inbound traffic | Any | Deny |
 
 ```bash
-gcloud compute firewall-rules create ome-origin01-allow-ssh \
-  --network="$NETWORK" --direction=INGRESS --action=ALLOW --priority=1000 \
-  --target-tags="$TAG" --source-ranges="$ADMIN_CIDR" --rules=tcp:22
-
-gcloud compute firewall-rules create ome-origin01-allow-web \
-  --network="$NETWORK" --direction=INGRESS --action=ALLOW --priority=1000 \
-  --target-tags="$TAG" --source-ranges="0.0.0.0/0" --rules=tcp:80,tcp:443
-
-gcloud compute firewall-rules create ome-origin01-allow-srt \
-  --network="$NETWORK" --direction=INGRESS --action=ALLOW --priority=1000 \
-  --target-tags="$TAG" --source-ranges="$VMIX_CIDR" --rules=udp:9999
+linode-cli firewalls create \
+  --label ome-origin01-fw \
+  --rules.outbound_policy ACCEPT \
+  --rules.inbound_policy DROP \
+  --rules.inbound '[{"protocol":"TCP","ports":"22","addresses":{"ipv4":["'"$ADMIN_CIDR"'"]},"action":"ACCEPT","label":"ssh-admin"},{"protocol":"TCP","ports":"80,443","addresses":{"ipv4":["0.0.0.0/0"],"ipv6":["::/0"]},"action":"ACCEPT","label":"web"},{"protocol":"UDP","ports":"9999","addresses":{"ipv4":["'"$VMIX_CIDR"'"]},"action":"ACCEPT","label":"srt-vmix"}]'
 ```
 
-2. Do not create rules for TCP 1935 or TCP 3333.
-3. Review existing rules before proceeding. In a default VPC, `default-allow-ssh` can allow SSH from the internet to every VM. Do not delete it without checking its impact on other VMs; instead ensure it does not target this origin or replace it through your approved network-change process.
+3. Note the firewall ID from the command output, then create the VM. `g6-standard-2` provides 2 vCPU and 4 GB RAM; increase capacity after load testing. These commands set `legacy_config` networking so `--firewall_id` attaches the firewall directly to the VM. If your account requires Linode Interfaces, create the VM in Akamai Cloud Manager and attach this firewall to the public interface.
 
 ```bash
-gcloud compute firewall-rules list --filter="network:$NETWORK" \
-  --format="table(name,direction,priority,sourceRanges.list():label=SOURCE,allowed[].map().firewall_rule().list():label=ALLOW,targetTags.list():label=TARGET_TAGS)"
+FIREWALL_ID="YOUR_FIREWALL_ID"
+
+linode-cli linodes create \
+  --label "$INSTANCE" \
+  --region "$REGION" \
+  --type "$TYPE" \
+  --image "$IMAGE" \
+  --authorized_keys "$(cat "$SSH_PUBLIC_KEY")" \
+  --firewall_id "$FIREWALL_ID" \
+  --interface_generation legacy_config \
+  --tags "$TAG" \
+  --booted true
 ```
 
-### 2.4 Create the origin DNS record in Cloudflare
+4. Note the VM ID and public IPv4 address from the create output, then mark that public IPv4 address as reserved. This keeps the origin address assigned to the Akamai account even if the VM is later deleted.
+
+```bash
+LINODE_ID="YOUR_LINODE_ID_FROM_CREATE_OUTPUT"
+ORIGIN_IPV4="YOUR_PUBLIC_IPV4_FROM_CREATE_OUTPUT"
+
+linode-cli networking ip-update "$ORIGIN_IPV4" --reserved true
+linode-cli linodes view "$LINODE_ID" --format "id,label,status,ipv4,region,type"
+```
+
+5. Do not create rules for TCP 1935 or TCP 3333.
+6. Review the firewall before proceeding:
+
+```bash
+linode-cli firewalls view "$FIREWALL_ID"
+```
+
+### 2.3 Create the origin DNS record in Cloudflare
 
 **Location: Cloudflare dashboard → `cockxing.online` → DNS → Records.**
 
@@ -150,20 +138,33 @@ gcloud compute firewall-rules list --filter="network:$NETWORK" \
 2. Set **Type** to `A`, **Name** to `origin01`, and **IPv4 address** to the reserved static IP displayed in step 2.2.
 3. Set **Proxy status** to **DNS only** (grey cloud), then save. Do not orange-cloud this record: Bunny must reach Caddy directly and Caddy must complete its own TLS challenge.
 4. Set a temporary TTL such as 300 seconds while testing, if Cloudflare exposes TTL for this DNS-only record.
-5. Understand the trade-off: DNS-only reveals the GCP origin IP. The Caddy secret-header gate and the restricted SRT firewall rule remain essential; do not use this VM for unrelated public services.
+5. Understand the trade-off: DNS-only reveals the Akamai origin IP. The Caddy secret-header gate and the restricted SRT firewall rule remain essential; do not use this VM for unrelated public services.
 6. `player01.cockxing.online` is created later as a Bunny CNAME; do not point it to the VM.
 
 ## 3. Prepare and secure the Ubuntu origin
 
 **Location: Administrator workstation first, then Origin SSH terminal. Working directory: home directory (`~`) after connecting.**
 
-1. From the administrator workstation, connect with OS Login. The workstation's public address must be included in `ADMIN_CIDR` in the Google Cloud firewall rule.
+1. From the administrator workstation, connect with SSH. The workstation's public address must be included in `ADMIN_CIDR` in the Akamai Cloud Firewall rule.
 
 ```bash
-gcloud compute ssh ome-origin01 --zone=YOUR_ZONE --project=YOUR_GOOGLE_CLOUD_PROJECT_ID
+ssh root@origin01.cockxing.online
 ```
 
-2. Continue in the resulting **Origin SSH terminal**. Install Docker and required utilities. Do not run a blanket OS upgrade during a production build.
+2. If this is the first login as `root`, create a sudo-capable deployment user, copy the SSH key authorization, and reconnect as that user before continuing.
+
+```bash
+adduser deploy
+usermod -aG sudo deploy
+install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
+cp /root/.ssh/authorized_keys /home/deploy/.ssh/authorized_keys
+chown deploy:deploy /home/deploy/.ssh/authorized_keys
+chmod 600 /home/deploy/.ssh/authorized_keys
+exit
+ssh deploy@origin01.cockxing.online
+```
+
+3. Continue in the resulting **Origin SSH terminal**. Install Docker and required utilities. Do not run a blanket OS upgrade during a production build.
 
 ```bash
 sudo apt update
@@ -172,7 +173,7 @@ sudo systemctl enable --now docker
 sudo install -d -m 750 "$HOME/ome/config" "$HOME/ome/caddy"
 ```
 
-3. Optionally add host-level UFW rules as defence in depth. The cloud firewall remains the authoritative control because Docker networking can bypass host firewall expectations. Replace the two placeholders before executing.
+4. Optionally add host-level UFW rules as defence in depth. The cloud firewall remains the authoritative control because Docker networking can bypass host firewall expectations. Replace the two placeholders before executing.
 
 ```bash
 sudo ufw default deny incoming
@@ -185,14 +186,14 @@ sudo ufw enable
 sudo ufw status numbered
 ```
 
-4. Generate the origin-header secret and save it with owner-only access. Record the displayed value in a password manager; it will be used in Caddy and Bunny.
+5. Generate the origin-header secret and save it with owner-only access. Record the displayed value in a password manager; it will be used in Caddy and Bunny.
 
 ```bash
 openssl rand -hex 32 | tee "$HOME/ome/caddy/origin-header-secret.txt"
 chmod 600 "$HOME/ome/caddy/origin-header-secret.txt"
 ```
 
-5. Confirm the resulting files and move to the deployment directory:
+6. Confirm the resulting files and move to the deployment directory:
 
 ```bash
 ls -la "$HOME/ome/caddy"
@@ -575,9 +576,11 @@ Monitor vMix output, SRT loss/retransmissions, OME logs, CPU/RAM/network, Bunny 
 
 ## References
 
-- [Google Cloud OS Login](https://cloud.google.com/compute/docs/oslogin)
-- [Google Cloud VPC firewall rules](https://cloud.google.com/firewall/docs/using-firewalls)
-- [Google Cloud firewall-rule CLI reference](https://cloud.google.com/sdk/gcloud/reference/compute/firewall-rules/create)
+- [Akamai Cloud create a compute instance](https://techdocs.akamai.com/cloud-computing/docs/create-a-compute-instance)
+- [Akamai Linode CLI](https://techdocs.akamai.com/cloud-computing/docs/getting-started-with-the-linode-cli)
+- [Akamai create a Linode API/CLI reference](https://techdocs.akamai.com/linode-api/reference/post-linode-instance)
+- [Akamai Cloud Firewall API/CLI reference](https://techdocs.akamai.com/linode-api/reference/post-firewalls)
+- [Akamai reserved IPs](https://techdocs.akamai.com/cloud-computing/docs/reserved-ips)
 - [Cloudflare proxy status](https://developers.cloudflare.com/dns/proxy-status/)
 - [Cloudflare proxying limitations](https://developers.cloudflare.com/dns/proxy-status/limitations/)
 - [OME configuration](https://ovenmedia.com/docs/ome/configuration)
