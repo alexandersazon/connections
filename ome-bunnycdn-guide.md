@@ -1,71 +1,108 @@
-# Global 24/7 Streaming: vMix → OvenMediaEngine → Bunny CDN
+# Global 24/7 Streaming: vMix -> OvenMediaEngine -> Bunny CDN
 
-This runbook publishes one 720p live stream from vMix to OvenMediaEngine (OME) over encrypted SRT, then delivers LL-HLS worldwide through Bunny CDN.
+This runbook deploys one 720p live stream from vMix to OvenMediaEngine (OME) using encrypted SRT, then delivers Low-Latency HLS (LL-HLS) through Bunny CDN.
+
+Follow the sections in order. Each phase ends with a validation check; do not start the next phase until that check passes.
+
+## 1. Target design and security model
 
 ```text
-vMix PC -- encrypted SRT --> OME -- private Docker network --> Caddy -- HTTPS --> Bunny CDN --> global viewers
+vMix PC -- encrypted SRT/UDP --> OME -- private Docker network --> Caddy -- HTTPS --> Bunny CDN --> viewers
 ```
 
-OME's playback port is private. Caddy accepts stream requests only when Bunny supplies a secret request header, and Bunny token authentication can protect the viewer URL.
+The stream path has three trust boundaries:
 
-> This is LL-HLS, not legacy HLS. The playback playlist is `master.m3u8`; do not use `index.m3u8` or a `ts:` URL.
-
-## Command locations
-
-Every instruction states where it is performed:
-
-| Label | Where to perform it |
+| Boundary | Control |
 |---|---|
-| **Cloudflare dashboard** | Cloudflare zone for `cockxing.online`; used only for DNS records in this design |
-| **Akamai Cloud Manager** | Akamai Cloud web console; used for account, region, reserved IP, and firewall review |
-| **Administrator workstation** | Administrator's local terminal with the Linode CLI authenticated to the Akamai Cloud account; used for provisioning and SSH |
-| **Origin SSH terminal** | SSH session to the Ubuntu VM, signed in as root initially or as a sudo-capable deployment user |
-| **Bunny dashboard** | `https://panel.bunny.net/` |
-| **vMix PC** | Windows computer running vMix |
-| **External test device** | A network other than the origin VM; ideally test locations in each target region |
+| vMix -> origin | SRT encryption plus a cloud-firewall rule that admits UDP 9999 only from the vMix public IP/VPN range. |
+| OME -> Internet | OME's LL-HLS port stays inside Docker. It is never published on the VM. |
+| Bunny -> origin | Caddy proxies only requests that contain a secret `X-Origin-Verify` request header set by Bunny. |
+| Bunny -> viewers | Optional Bunny Advanced Token Authentication provides short-lived signed viewer URLs. |
 
-## 1. Plan the service
+Important:
 
-**Location: your planning workstation. No command is required.**
+- This design uses LL-HLS. The playback playlist is `master.m3u8`; do not use `index.m3u8` or a `ts:` URL.
+- OME does no transcoding. vMix must produce H.264 video and AAC audio.
+- The Cloudflare origin record is **DNS only**. This exposes the origin IP, so use this VM only for this streaming service and retain every firewall/header control below.
+- CDN delivery is global, but the origin should be close to the vMix encoder. Distance to the origin can increase live latency on an edge-cache miss.
 
-1. Place the origin VM close to the vMix encoder. This keeps the real-time SRT contribution path short; Bunny's CDN handles global viewer delivery.
-2. For one bypassed 720p stream, start with 2 vCPU, 4 GB RAM, a 1 Gbps NIC, and Ubuntu 24.04 LTS. Load-test before an event.
-3. Use Bunny Standard with all delivery regions enabled for the best worldwide coverage. A distant edge can still have greater live latency on cache misses because it must contact the origin.
-4. Plan a warm standby only if global availability is required. It needs a second encoder contribution path, its own origin name, and a rehearsed player-DNS/traffic-manager failover procedure.
+## 2. Deployment worksheet
+
+Complete this table before running commands. Commands deliberately use placeholders so a value is never silently guessed.
+
+| Item | Example / required value |
+|---|---|
+| Origin DNS name | `origin01.cockxing.online` |
+| Viewer DNS name | `player01.cockxing.online` |
+| Akamai region | Nearest region to vMix, for example `ap-south` |
+| VM label | `ome-origin01` |
+| VM plan | `g6-standard-2` (2 vCPU, 4 GB RAM) to start |
+| Administrator CIDR | Your fixed public IPv4/VPN range, for example `203.0.113.10/32` |
+| vMix CIDR | vMix site public IPv4/VPN range, for example `198.51.100.20/32` |
+| vMix SRT passphrase | A separately stored strong secret |
+| Partner embed origins | Exact HTTPS origins, for example `https://www.partner.example` |
+| Bunny token key | Created in Bunny and stored only in the authorizing backend |
+
+### Capacity and cost planning
+
+For one bypassed 720p stream, begin with 2 vCPU, 4 GB RAM, a 1 Gbps NIC, and Ubuntu 24.04 LTS. Load-test with the real encoder and player before an event. Plan a warm standby only when the service needs global high availability; it requires a second contribution path, another origin name, and a rehearsed traffic/DNS failover plan.
 
 At 3,000 Kbps video plus 128 Kbps audio, one continuous viewer transfers about **1.41 GB/hour**. At 1,000 concurrent viewers for 30 days, delivery is approximately **1.01 PB/month** before overhead.
 
-| Viewer region | Bunny Standard price | 1.01 PB if all traffic is in that region |
+| Viewer region | Bunny Standard price | Approximate cost for 1.01 PB entirely in that region |
 |---|---:|---:|
 | Europe & North America | $0.01/GB | ~$10,080/month |
 | Asia & Oceania | $0.03/GB | ~$30,240/month |
 | South America | $0.045/GB | ~$45,360/month |
 | Middle East & Africa | $0.06/GB | ~$60,480/month |
 
-Calculate the expected bill from the expected traffic share in each region. For an even four-region split, the baseline is about **$36,540/month**. Verify live pricing before committing; Bunny Volume is cheaper but has fewer PoPs and needs audience testing.
+Calculate the bill from the expected regional traffic mix. An even four-region split has a baseline near **$36,540/month**. Verify current Bunny pricing before committing; Bunny Volume may cost less but has fewer PoPs and requires audience testing.
 
-## 2. Create the Akamai origin VM
+## 3. Where each action happens
 
-### 2.1 Select the Akamai region and secure administrator access
+| Location label | Use it for |
+|---|---|
+| **Cloudflare dashboard** | DNS records in the `cockxing.online` zone only. |
+| **Akamai Cloud Manager** | Account, region, firewall, and VM review. |
+| **Administrator workstation** | A local terminal with the Linode CLI authenticated to the Akamai Cloud account. |
+| **Origin SSH terminal** | An SSH session to the Ubuntu VM, initially as `root` and then as `deploy`. |
+| **Bunny dashboard** | Pull Zone, custom hostname, Edge Rules, token authentication, and metrics. |
+| **vMix PC** | The Windows machine running vMix. |
+| **External test device** | A device/network other than the origin, ideally in each viewer region. |
 
-**Location: Akamai Cloud Manager and Administrator workstation.**
+## 4. Prerequisites and readiness check
+
+Before provisioning, confirm all of the following:
+
+- You control the `cockxing.online` DNS zone in Cloudflare.
+- You have an Akamai Cloud account, an administrator SSH public key, and an authenticated Linode CLI.
+- You know the administrator and vMix source public IP ranges. If either location uses changing IPs, use a fixed VPN egress range instead.
+- Ports 80 and 443 may be publicly reached during Caddy certificate issuance and by Bunny. UDP 9999 may be reached only from the vMix CIDR.
+- You have a Bunny account and authority to create a Pull Zone and custom hostname.
+- If the stream is private, the viewer website has a server-side backend/secret manager able to issue signed Bunny URLs. Browser JavaScript is not sufficient because it would expose the signing key.
+
+## 5. Phase 1 - Create the origin VM and public DNS
+
+### 5.1 Choose the region and administrator access
+
+**Location: Akamai Cloud Manager and Administrator workstation**
 
 1. Select the Akamai Cloud account that will own the origin.
-2. Choose an Akamai Cloud region nearest the vMix PC. Example: `ap-south` for Singapore. The example value below must be replaced with the region you choose.
-3. Create or select an SSH key pair for the administrator. The public key is installed on the VM during provisioning.
-4. Install and authenticate the Linode CLI if it is not already configured:
+2. Choose the region nearest vMix. Replace `YOUR_AKAMAI_REGION` below with that region.
+3. Create or select the administrator SSH key pair. Its public key is installed during provisioning.
+4. Install and authenticate the Linode CLI if necessary:
 
 ```bash
 linode-cli configure
 ```
 
-5. Determine and record the public IPv4 addresses/CIDR ranges for the administrator workstation and the vMix site.
+5. Record the administrator and vMix IPv4 CIDRs in the deployment worksheet.
 
-### 2.2 Create the Akamai Cloud Firewall and VM
+### 5.2 Create the cloud firewall
 
-**Location: Administrator workstation. Working directory: home directory (`~`).**
+**Location: Administrator workstation. Working directory: home directory (`~`)**
 
-1. Set the following variables. Replace every all-uppercase placeholder before executing.
+1. Set the variables. Replace every uppercase placeholder before continuing.
 
 ```bash
 REGION="YOUR_AKAMAI_REGION"
@@ -78,15 +115,14 @@ ADMIN_CIDR="YOUR_ADMIN_PUBLIC_IP/32"
 VMIX_CIDR="YOUR_VMIX_PUBLIC_IP/32"
 ```
 
-2. Create an Akamai Cloud Firewall. The inbound default is drop, so only SSH, HTTPS setup traffic, HTTPS playback origin traffic, and SRT ingest are allowed.
+2. Create a default-deny firewall. The permitted inbound paths are intentional:
 
-| Rule | Source | Action |
+| Protocol/port | Source | Purpose |
 |---|---|---|
-| TCP 22 | administrator public IP or VPN CIDR only | Allow |
-| TCP 80 | Internet | Allow |
-| TCP 443 | Internet | Allow |
-| UDP 9999 | vMix public IP or VPN CIDR only | Allow |
-| Any other inbound traffic | Any | Deny |
+| TCP 22 | Administrator CIDR only | Administration |
+| TCP 80, 443 | Internet | Caddy certificate validation and Bunny origin pulls |
+| UDP 9999 | vMix CIDR only | SRT contribution |
+| All other inbound | Any | Deny |
 
 ```bash
 linode-cli firewalls create \
@@ -96,7 +132,7 @@ linode-cli firewalls create \
   --rules.inbound '[{"protocol":"TCP","ports":"22","addresses":{"ipv4":["'"$ADMIN_CIDR"'"]},"action":"ACCEPT","label":"ssh-admin"},{"protocol":"TCP","ports":"80,443","addresses":{"ipv4":["0.0.0.0/0"],"ipv6":["::/0"]},"action":"ACCEPT","label":"web"},{"protocol":"UDP","ports":"9999","addresses":{"ipv4":["'"$VMIX_CIDR"'"]},"action":"ACCEPT","label":"srt-vmix"}]'
 ```
 
-3. Note the firewall ID from the command output, then create the VM. `g6-standard-2` provides 2 vCPU and 4 GB RAM; increase capacity after load testing. These commands set `legacy_config` networking so `--firewall_id` attaches the firewall directly to the VM. If your account requires Linode Interfaces, create the VM in Akamai Cloud Manager and attach this firewall to the public interface.
+3. Copy the firewall ID from the response and create the VM. `legacy_config` lets `--firewall_id` attach the firewall directly. If your account uses Linode Interfaces, create the VM in Akamai Cloud Manager and attach this firewall to its public interface.
 
 ```bash
 FIREWALL_ID="YOUR_FIREWALL_ID"
@@ -113,7 +149,7 @@ linode-cli linodes create \
   --booted true
 ```
 
-4. Note the VM ID and public IPv4 address from the create output, then mark that public IPv4 address as reserved. This keeps the origin address assigned to the Akamai account even if the VM is later deleted.
+4. Copy the VM ID and public IPv4 from the response. Reserve that IPv4 so it remains allocated to your account even if the VM is deleted.
 
 ```bash
 LINODE_ID="YOUR_LINODE_ID_FROM_CREATE_OUTPUT"
@@ -123,35 +159,39 @@ linode-cli networking ip-update "$ORIGIN_IPV4" --reserved true
 linode-cli linodes view "$LINODE_ID" --format "id,label,status,ipv4,region,type"
 ```
 
-5. Do not create rules for TCP 1935 or TCP 3333.
-6. Review the firewall before proceeding:
+5. Review before proceeding:
 
 ```bash
 linode-cli firewalls view "$FIREWALL_ID"
 ```
 
-### 2.3 Create the origin DNS record in Cloudflare
+Do not add rules for TCP 1935 or TCP 3333. RTMP is not used and OME's playback port must stay private.
 
-**Location: Cloudflare dashboard → `cockxing.online` → DNS → Records.**
+### 5.3 Create the origin DNS record
 
-1. Select **Add record**.
-2. Set **Type** to `A`, **Name** to `origin01`, and **IPv4 address** to the reserved static IP displayed in step 2.2.
-3. Set **Proxy status** to **DNS only** (grey cloud), then save. Do not orange-cloud this record: Bunny must reach Caddy directly and Caddy must complete its own TLS challenge.
-4. Set a temporary TTL such as 300 seconds while testing, if Cloudflare exposes TTL for this DNS-only record.
-5. Understand the trade-off: DNS-only reveals the Akamai origin IP. The Caddy secret-header gate and the restricted SRT firewall rule remain essential; do not use this VM for unrelated public services.
-6. `player01.cockxing.online` is created later as a Bunny CNAME; do not point it to the VM.
+**Location: Cloudflare dashboard -> `cockxing.online` -> DNS -> Records**
 
-## 3. Prepare and secure the Ubuntu origin
+1. Choose **Add record**.
+2. Create an `A` record with **Name** `origin01` and the reserved `ORIGIN_IPV4` address.
+3. Set **Proxy status** to **DNS only** (grey cloud), then save. Do not orange-cloud it: Bunny must connect to Caddy directly, and Caddy must complete its own TLS challenge.
+4. Use a temporary TTL such as 300 seconds while testing, if Cloudflare presents that option.
+5. Do not create `player01` here yet. It is created later as a Bunny-directed CNAME.
 
-**Location: Administrator workstation first, then Origin SSH terminal. Working directory: home directory (`~`) after connecting.**
-
-1. From the administrator workstation, connect with SSH. The workstation's public address must be included in `ADMIN_CIDR` in the Akamai Cloud Firewall rule.
+**Phase 1 gate:** From the administrator workstation, confirm DNS resolves to the reserved address and SSH is reachable:
 
 ```bash
 ssh root@origin01.cockxing.online
 ```
 
-2. If this is the first login as `root`, create a sudo-capable deployment user, copy the SSH key authorization, and reconnect as that user before continuing.
+If SSH fails, verify that the workstation's current public IP is inside `ADMIN_CIDR` and that the cloud firewall is attached to the VM.
+
+## 6. Phase 2 - Prepare and secure Ubuntu
+
+### 6.1 Create a deployment account
+
+**Location: Origin SSH terminal**
+
+If this is the initial `root` login, create a restricted deployment workflow before installing software:
 
 ```bash
 adduser deploy
@@ -161,10 +201,21 @@ cp /root/.ssh/authorized_keys /home/deploy/.ssh/authorized_keys
 chown deploy:deploy /home/deploy/.ssh/authorized_keys
 chmod 600 /home/deploy/.ssh/authorized_keys
 exit
+```
+
+**Location: Administrator workstation**
+
+Reconnect as the deployment user:
+
+```bash
 ssh deploy@origin01.cockxing.online
 ```
 
-3. Continue in the resulting **Origin SSH terminal**. Install Docker and required utilities. Do not run a blanket OS upgrade during a production build.
+### 6.2 Install the runtime and create directories
+
+**Location: Origin SSH terminal. Working directory: home directory (`~`)**
+
+Do not run a blanket OS upgrade during a production build. Install only the required packages and start Docker:
 
 ```bash
 sudo apt update
@@ -173,7 +224,7 @@ sudo systemctl enable --now docker
 sudo install -d -m 750 "$HOME/ome/config" "$HOME/ome/caddy"
 ```
 
-4. Optionally add host-level UFW rules as defence in depth. The cloud firewall remains the authoritative control because Docker networking can bypass host firewall expectations. Replace the two placeholders before executing.
+Optional defence in depth: add UFW rules. The Akamai Cloud Firewall remains the authoritative control because Docker networking can bypass host-firewall assumptions. Replace the placeholders before execution.
 
 ```bash
 sudo ufw default deny incoming
@@ -186,32 +237,35 @@ sudo ufw enable
 sudo ufw status numbered
 ```
 
-5. Generate the origin-header secret and save it with owner-only access. Record the displayed value in a password manager; it will be used in Caddy and Bunny.
+### 6.3 Generate the origin request secret
+
+**Location: Origin SSH terminal**
+
+Generate the random secret that Bunny will send and Caddy will check. Save the displayed value in a password manager; it is needed exactly once in Caddy and once in Bunny.
 
 ```bash
 openssl rand -hex 32 | tee "$HOME/ome/caddy/origin-header-secret.txt"
 chmod 600 "$HOME/ome/caddy/origin-header-secret.txt"
-```
-
-6. Confirm the resulting files and move to the deployment directory:
-
-```bash
 ls -la "$HOME/ome/caddy"
 cd "$HOME/ome"
 pwd
 ```
 
-## 4. Create the OME configuration
+Never put this value in source control, chat, screenshots, browser code, or a public ticket.
 
-**Location: Origin SSH terminal. Working directory: `~/ome`.**
+**Phase 2 gate:** `~/ome/config`, `~/ome/caddy`, and a mode-`600` secret file exist under the `deploy` account.
 
-1. Create the configuration file:
+## 7. Phase 3 - Configure OME
+
+**Location: Origin SSH terminal. Working directory: `~/ome`**
+
+1. Create the OME server configuration:
 
 ```bash
 nano ~/ome/config/Server.xml
 ```
 
-2. Paste the following XML, save with `Ctrl+O`, press `Enter`, and exit with `Ctrl+X`.
+2. Paste the following configuration, then save (`Ctrl+O`, `Enter`) and exit (`Ctrl+X`).
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -267,19 +321,21 @@ nano ~/ome/config/Server.xml
 </Server>
 ```
 
-3. Verify the file exists and contains the required LL-HLS and SRT sections:
+3. Confirm the required sections are present:
 
 ```bash
 grep -nE 'Server version|<SRT>|<LLHLS>|<Name>app' ~/ome/config/Server.xml
 ```
 
-OME bypasses transcoding. vMix must therefore send H.264 video and AAC audio. LL-HLS latency is mainly governed by `ChunkDuration` and the player live buffer, not by making segments arbitrarily short.
+`ChunkDuration` and the player live buffer are the main LL-HLS latency controls. Do not attempt to reduce latency by making segments arbitrarily short.
 
-## 5. Configure Caddy and Docker Compose
+## 8. Phase 4 - Configure Caddy and start the containers
 
-**Location: Origin SSH terminal. Working directory: `~/ome`.**
+**Location: Origin SSH terminal. Working directory: `~/ome`**
 
-1. Display the secret and copy it only into the next configuration and Bunny; do not paste it into chat, source control, screenshots, or a public ticket.
+### 8.1 Configure the Caddy origin gate
+
+1. Display the secret locally, copy it directly into the next file, and avoid exposing it anywhere else:
 
 ```bash
 cat ~/ome/caddy/origin-header-secret.txt
@@ -291,7 +347,7 @@ cat ~/ome/caddy/origin-header-secret.txt
 nano ~/ome/caddy/Caddyfile
 ```
 
-3. Paste the following, replacing `PASTE_THE_SECRET_FROM_THE_FILE` with the copied value. Save and exit.
+3. Replace `PASTE_THE_SECRET_FROM_THE_FILE` with the exact copied secret, then save:
 
 ```caddyfile
 origin01.cockxing.online {
@@ -303,13 +359,17 @@ origin01.cockxing.online {
 }
 ```
 
-4. Create the Compose file:
+Any request that omits or mismatches the header gets `404`; OME is not directly exposed.
+
+### 8.2 Create and launch Docker Compose
+
+1. Create the Compose file:
 
 ```bash
 nano ~/ome/docker-compose.yml
 ```
 
-5. Paste, save, and exit:
+2. Paste and save:
 
 ```yaml
 services:
@@ -342,7 +402,7 @@ volumes:
   caddy_config:
 ```
 
-6. Validate the Compose syntax, start both containers, and check their state:
+3. Validate the file, start both containers, and inspect startup logs:
 
 ```bash
 cd ~/ome
@@ -352,150 +412,172 @@ sudo docker compose ps
 sudo docker compose logs --tail=100 ome caddy
 ```
 
-Expected result: both services show as running. Caddy obtains a TLS certificate for `origin01.cockxing.online`; if it does not, first confirm the DNS A record and cloud firewall rules for ports 80 and 443.
+Expected result: both services are running and Caddy has obtained a TLS certificate for `origin01.cockxing.online`. If Caddy fails to issue a certificate, check the DNS `A` record plus cloud-firewall access to TCP 80 and 443.
 
-7. Confirm the origin is not publicly playable.
+### 8.3 Confirm that the origin is gated
 
-**Location: External test device.**
+**Location: External test device**
+
+Run this unauthenticated request:
 
 ```bash
 curl -I https://origin01.cockxing.online/app/linear/master.m3u8
 ```
 
-Expected result: `404`, not a playlist. Do not continue if it returns stream content.
+**Phase 4 gate:** The response is `404`, not a playlist. Do not continue if stream content is publicly available from the origin.
 
-## 6. Configure vMix SRT contribution
+## 9. Phase 5 - Configure vMix SRT contribution
 
-**Location: vMix PC.**
+**Location: vMix PC**
 
-1. Open your vMix production preset.
-2. Click the gear icon beside **Stream**, choose an unused destination, and select **SRT** with mode **Caller**.
-3. Enter these values. If your vMix release exposes encryption in a different pane, enable it there.
+1. Open the production preset.
+2. Click the gear beside **Stream**, select an unused destination, choose **SRT**, and use **Caller** mode.
+3. Enter these values. Enable encryption in the appropriate pane if the vMix version places it elsewhere.
 
-| Setting | Value |
+| vMix setting | Value |
 |---|---|
-| Host | origin VM public IP or a dedicated ingest DNS name |
+| Host | Origin VM public IP or a dedicated ingest DNS name |
 | Port | `9999` |
 | Stream ID | `default/app/linear` |
-| Latency | Start at `120 ms`; increase if WAN loss or jitter appears |
-| Encryption | Enable with a strong passphrase; use 32-byte key length where available |
+| Latency | Start at `120 ms`; raise it if WAN loss/jitter appears |
+| Encryption | Strong passphrase; use a 32-byte key length where offered |
 | Video | H.264, 1280x720, 30 fps, 3,000 Kbps CBR |
 | Audio | AAC-LC, 128 Kbps |
 | Keyframe interval | 2 seconds |
 
-4. If vMix accepts a single SRT URL, use this structure; replace all-uppercase placeholders and retain the `streamid` query parameter:
+If vMix accepts a single SRT URL, use this format. Substitute the Akamai origin IP and SRT secret; keep the `streamid` query parameter.
 
 ```text
-srt://GOOGLE_CLOUD_STATIC_IP:9999?streamid=default/app/linear&passphrase=YOUR_SRT_SECRET&pbkeylen=32
+srt://ORIGIN_STATIC_IP:9999?streamid=default/app/linear&passphrase=YOUR_SRT_SECRET&pbkeylen=32
 ```
 
-5. Enable vMix's automatic reconnect option, save the preset, and start streaming.
-6. Return to the **Origin SSH terminal** and confirm OME sees the ingest:
+Enable vMix automatic reconnect, save the preset, and start streaming.
+
+**Location: Origin SSH terminal**
+
+Confirm that OME sees the contribution:
 
 ```bash
 cd ~/ome
 sudo docker compose logs --tail=100 -f ome
 ```
 
-After the stream appears, stop following logs with `Ctrl+C`. The origin still returns 404 externally until Bunny is configured with the secret header.
+Stop following the log with `Ctrl+C` after the stream appears. The external origin URL must still return `404` because Bunny has not yet supplied the secret header.
 
-## 7. Configure Bunny CDN
+**Phase 5 gate:** OME logs show the `default/app/linear` SRT stream and no public origin playlist is available.
 
-### 7.1 Create the Pull Zone
+## 10. Phase 6 - Configure Bunny CDN
 
-**Location: Bunny dashboard.**
+### 10.1 Create the Pull Zone
 
-1. Open **CDN → Pull Zones → Add Pull Zone**.
-2. Name it `player01` (or another descriptive, unique name).
-3. Select an **Origin URL** and enter `https://origin01.cockxing.online`.
-4. Choose the **Standard** tier.
-5. Enable all delivery regions: Europe/North America, Asia/Oceania, South America, and Middle East/Africa.
-6. Create the zone, then set **Origin Host Header** to `origin01.cockxing.online` and leave origin SSL verification enabled.
-7. Enable Origin Shield in a location close to the origin. Measure global playback; turn it off only if it demonstrably harms the required live latency.
-8. Enable request coalescing, block root-path access, block POST requests, and set a monthly bandwidth limit/alert.
+**Location: Bunny dashboard**
 
-### 7.2 Configure the Bunny-to-origin secret header
+1. Open **CDN -> Pull Zones -> Add Pull Zone**.
+2. Name it `player01`, or use another unique descriptive name.
+3. Set **Origin URL** to `https://origin01.cockxing.online`.
+4. Select the **Standard** tier and enable delivery regions needed by the audience: Europe/North America, Asia/Oceania, South America, and Middle East/Africa.
+5. Create the zone.
+6. Set **Origin Host Header** to `origin01.cockxing.online`, and keep origin SSL verification enabled.
+7. Enable Origin Shield in a location close to the origin. Measure worldwide playback and disable it only if it demonstrably misses the live-latency requirement.
+8. Enable request coalescing, block root-path access and POST requests, and set a monthly bandwidth limit/alert.
 
-**Location: Bunny dashboard.**
+### 10.2 Add the Bunny-to-origin secret header
+
+**Location: Bunny dashboard**
 
 1. In the Pull Zone, open **Edge Rules** and add a rule that applies to every request.
-2. Select the action **Set Request Header**.
-3. Set header name to `X-Origin-Verify`.
-4. Set the value to the exact value from `~/ome/caddy/origin-header-secret.txt`.
+2. Select **Set Request Header**.
+3. Set the header name to `X-Origin-Verify`.
+4. Set its value to the exact value in `~/ome/caddy/origin-header-secret.txt`.
 5. Save and enable the rule.
-6. The value is a secret. Do not put it in browser code or configure it as a response header.
 
-### 7.3 Add the custom playback hostname
+The value must remain a request secret. Never send it as a response header and never include it in browser code.
 
-**Location: Bunny dashboard, then Cloudflare dashboard → `cockxing.online` → DNS → Records.**
+### 10.3 Add the viewer hostname
+
+**Location: Bunny dashboard, then Cloudflare dashboard -> `cockxing.online` -> DNS -> Records**
 
 1. In the Pull Zone custom-hostname area, add `player01.cockxing.online`.
-2. Bunny displays the CNAME target required for this zone. Copy that exact target.
-3. In **Cloudflare**, select **Add record**, set **Type** to `CNAME`, **Name** to `player01`, and **Target** to Bunny's displayed target. Do not guess the target and do not point it to the origin VM.
-4. Set **Proxy status** to **DNS only** (grey cloud) and save. Orange-clouding a CNAME to another CDN can cause connectivity or certificate problems and would insert Cloudflare in front of Bunny.
-5. Return to Bunny and wait until the hostname certificate is active.
-6. Confirm DNS and TLS from an **External test device**:
+2. Copy the exact CNAME target Bunny displays.
+3. In Cloudflare, add a `CNAME` record with **Name** `player01` and **Target** equal to Bunny's displayed target. Do not guess the target and do not point this record at the origin VM.
+4. Set Cloudflare **Proxy status** to **DNS only** (grey cloud) and save. Orange-clouding another CDN can introduce certificate or connectivity failures and inserts Cloudflare in front of Bunny.
+5. Return to Bunny and wait for the custom-hostname certificate to become active.
+
+**Location: External test device**
+
+Confirm DNS and TLS:
 
 ```bash
 curl -I https://player01.cockxing.online/
 ```
 
-A 403/404 at `/` is expected because root access is blocked; the important result is a valid HTTPS connection.
+A `403` or `404` at `/` is expected because root access is blocked. A valid HTTPS connection is the success condition.
 
-### 7.4 Set caching and access policy
+### 10.4 Configure caching and viewer access
 
-**Location: Bunny dashboard.**
+**Location: Bunny dashboard**
 
-1. Add an extension cache rule for `.m3u8`: edge cache TTL `0`/do not cache and browser cache `no-store`.
-2. Add an extension cache rule for `.m4s`: edge and browser cache TTL `10 minutes`.
-3. Do not globally ignore query strings if token authentication will be used.
-4. For a non-public stream, enable **Advanced Token Authentication**. Generate short-lived, path-based directory tokens for `/app/linear/` in your server-side application. Path-based tokens allow the playlist's relative segment requests to inherit authorization.
-5. Treat allowed-referrer settings as an additional deterrent only, not as authentication.
+1. Add an extension cache rule for `.m3u8`: edge TTL `0`/do not cache; browser cache `no-store`.
+2. Add an extension cache rule for `.m4s`: edge and browser TTL `10 minutes`.
+3. Do **not** globally ignore query strings when token authentication is used.
+4. For a non-public stream, enable **Advanced Token Authentication**. Use short-lived path-based directory tokens for `/app/linear/`, created only by a server-side application. Directory tokens let the playlist's relative media requests retain authorization.
+5. Treat allowed-referrer rules as a deterrent/cost control, not authentication.
 
-## 8. Secure embedding on another website
+**Phase 6 gate:** From an external device, open the viewer URL in an LL-HLS-capable player or test page:
 
-Use signed URLs as the access control. CORS only permits a browser to read cross-origin media responses; it does **not** stop somebody from copying a public stream URL.
+```text
+https://player01.cockxing.online/app/linear/master.m3u8
+```
 
-### 8.1 Enable viewer authentication
+Video and audio should begin. Browser/player requests for both the playlist and `.m4s` files must go to `player01.cockxing.online`, never `origin01.cockxing.online`.
 
-**Location: Bunny dashboard.**
+## 11. Phase 7 - Secure a stream embedded on another website
 
-1. Open **CDN → Pull Zones → `player01` → Security**.
+Signed URLs are the access control. CORS only permits browser JavaScript to read cross-origin media responses; it does not stop someone from copying an otherwise public URL.
+
+### 11.1 Enable viewer authentication
+
+**Location: Bunny dashboard**
+
+1. Open **CDN -> Pull Zones -> `player01` -> Security**.
 2. Enable **Advanced Token Authentication** and copy the URL Token Authentication Key.
-3. Store that key only in the secret manager or server-side environment variables for the application that authorizes viewers. Never add it to an HTML page, browser JavaScript bundle, CMS setting visible to editors, or a partner website.
-4. Keep the existing rule that does not globally ignore query strings. The token signer must control the parameters in the playback URL.
+3. Put that key only in the authorizing backend's secret manager or server-side environment variables.
+4. Never put the key in HTML, browser JavaScript, an editor-visible CMS setting, or a partner site.
+5. Keep the existing query-string policy; the signer controls the playback URL parameters.
 
-### 8.2 Issue a short-lived, directory token from your website backend
+### 11.2 Issue a short-lived directory token
 
-**Location: the backend/service that authenticates the viewer; not the visitor's browser.**
+**Location: Backend/service that authenticates the viewer, never the visitor's browser**
 
-1. Authenticate the viewer and check that they are entitled to watch before issuing any stream URL.
+For each viewing session:
+
+1. Authenticate the viewer and confirm their entitlement before issuing a URL.
 2. Use Bunny's Advanced Token Authentication signer with these inputs:
 
-| Signer setting | Value |
+| Signer input | Value |
 |---|---|
 | Base URL | `https://player01.cockxing.online/app/linear/master.m3u8` |
 | Token type | Path-based directory token |
 | Token path | `/app/linear/` |
-| Expiry | 5–15 minutes, based on your viewing-session design |
-| Signing key | The server-side Bunny URL Token Authentication Key |
+| Expiry | 5-15 minutes, matching the viewing-session design |
+| Signing key | Server-side Bunny URL Token Authentication Key |
 
-3. Return the resulting signed playback URL only to the authorized viewer. Its path starts with `bcdn_token=...`; this is required so the playlist's relative `.m4s` requests automatically inherit the token.
-4. Log the entitlement decision and token expiry, but never log the full signed URL or signing key.
-5. Do not enable IP locking by default. It can interrupt users on mobile networks, VPNs, or networks that change address. If you enable it, sign with the viewer's IPv4 address and test that all intended users can play.
+3. Return the signed playback URL only to the authorized viewer. Its path begins with `bcdn_token=...`; this allows relative `.m4s` requests to inherit the token.
+4. Log the entitlement decision and expiry, but never log the complete signed URL or the signing key.
+5. Do not enable IP locking by default. It can interrupt viewers roaming between mobile/VPN networks. If it is needed, sign with the viewer's IPv4 and test thoroughly.
 
-### 8.3 Permit the embedding website through CORS
+### 11.3 Allow the exact website origins with CORS
 
-**Location: Origin SSH terminal. Working directory: `~/ome`.**
+**Location: Origin SSH terminal. Working directory: `~/ome`**
 
-1. Identify the exact origin of the website that embeds the player, for example `https://www.partner.example`. The scheme and hostname must match exactly.
+1. Identify each exact embedding page origin, including scheme and hostname: for example `https://www.partner.example`.
 2. Edit OME's configuration:
 
 ```bash
 nano ~/ome/config/Server.xml
 ```
 
-3. Under `<CrossDomains>`, add one `<Url>` entry for each permitted website. Keep `player01.cockxing.online` if it hosts a player page; add the partner site separately:
+3. Under `<CrossDomains>`, retain `player01.cockxing.online` if it hosts a player page and add one `<Url>` per permitted embed origin:
 
 ```xml
 <CrossDomains>
@@ -504,7 +586,7 @@ nano ~/ome/config/Server.xml
 </CrossDomains>
 ```
 
-4. Save the file and restart only OME:
+4. Restart only OME and inspect the log:
 
 ```bash
 cd ~/ome
@@ -512,57 +594,52 @@ sudo docker compose restart ome
 sudo docker compose logs --tail=100 ome
 ```
 
-5. Test playback from the partner site. A browser CORS error means the embedding page's actual origin was not allowlisted. A `403` means the signed token, expiry, or optional hotlink policy is wrong.
+5. Test from the actual partner page. A browser CORS error means the page's actual origin is not listed. A `403` points to the signed token, its expiry, or an optional hotlink policy.
 
-### 8.4 Optional hotlink protection
+### 11.4 Optional hotlink protection
 
-**Location: Bunny dashboard.**
+**Location: Bunny dashboard**
 
-1. In the Pull Zone's **Security** settings, add the embedding domains to **Allowed Referrers** without a scheme, for example `partner.example` and `www.partner.example`.
-2. Add every legitimate embed domain. `*.partner.example` does not include `partner.example`, so add both if both are used.
-3. Consider enabling **Block Direct URL File Access** only after testing mobile apps, privacy browsers, email links, and casting. They can legitimately omit a `Referer` header.
-4. Treat hotlink protection as a cost-control layer, not authentication: referrers can be absent or spoofed. Keep signed tokens enabled for protected video.
+1. Under Pull Zone **Security**, add allowed referrers without a scheme, for example `partner.example` and `www.partner.example`.
+2. Include every legitimate embed domain. `*.partner.example` does not include `partner.example`, so add both if required.
+3. Enable **Block Direct URL File Access** only after testing mobile apps, privacy browsers, email links, and casting. These can legitimately omit `Referer`.
+4. Keep signed tokens enabled: referrers may be missing or spoofed.
 
-## 9. Block a country
+## 12. Optional policy - Block a country
 
-Country blocking is enforced by Bunny using the viewer's IP geolocation. It applies to the whole Pull Zone, so it blocks both the playlist and media fragments.
+Country blocking is enforced by Bunny using the viewer's IP geolocation. It applies to the whole Pull Zone, which blocks both playlists and media fragments.
 
-**Location: Bunny dashboard.**
+**Location: Bunny dashboard**
 
-1. Open **CDN → Pull Zones → `player01`** and locate the **Blocked Countries** setting under Security or Geographic restrictions.
-2. Add the country to block using its ISO 3166-1 alpha-2 code. For example, use `XX` only as a placeholder—replace it with the real two-letter country code before saving.
-3. Save and enable the setting. Do not disable the corresponding global delivery region; disabling a delivery region can reroute the user rather than block them.
-4. Test with a reputable exit node in the blocked country and one in an allowed country. Confirm the blocked viewer receives `403` for both `master.m3u8` and `.m4s` requests.
-5. Document the business/legal reason, approver, date, and review date. IP geolocation is not a substitute for legal advice and can be bypassed by VPNs.
+1. Open **CDN -> Pull Zones -> `player01`** and find **Blocked Countries** under Security or geographic restrictions.
+2. Add the target ISO 3166-1 alpha-2 country code. `XX` is only a placeholder; replace it with a real code.
+3. Save and enable it. Do not disable the matching global delivery region: disabling a region may reroute rather than block the viewer.
+4. Test from a reputable exit node in the blocked country and an allowed country. The blocked case should receive `403` for both `master.m3u8` and `.m4s` requests.
+5. Record the business/legal reason, approver, date, and review date. IP geolocation can be bypassed by VPNs and is not legal advice.
 
-If different viewers need different country access, do not use Pull-Zone-wide blocking. Instead, have the server-side Advanced Token signer include `token_countries` or `token_countries_blocked` for that viewer's directory token.
+If country access must vary per viewer, do not use a Pull-Zone-wide block. Instead, have the server-side directory-token signer use `token_countries` or `token_countries_blocked` for that viewer.
 
-## 10. Verify playback
+## 13. Final acceptance checklist
 
-**Location: External test device.**
+Complete these checks before calling the stream ready:
 
-1. Open this URL in an LL-HLS capable player or your test webpage:
+- [ ] Cloud firewall allows only administrator SSH, public TCP 80/443, and vMix-only UDP 9999.
+- [ ] `origin01` is DNS-only, points at the reserved IP, and returns `404` for an unauthenticated playlist request.
+- [ ] OME's TCP 3333 is not published by Docker or permitted by the firewall.
+- [ ] vMix sends encrypted SRT using `default/app/linear`; OME logs confirm the live input.
+- [ ] Caddy and OME containers remain running after a restart.
+- [ ] Bunny sends `X-Origin-Verify`; the viewer hostname has a valid certificate and plays the stream.
+- [ ] Playlist and media requests use `player01`, not the origin hostname.
+- [ ] `.m3u8` is not cached; `.m4s` has the intended TTL.
+- [ ] If protected, a valid short-lived token plays and an expired/missing token fails.
+- [ ] If embedded, every actual website origin is in `<CrossDomains>` and partner playback has no CORS error.
+- [ ] Tests from meaningful audience regions record startup time, rebuffer count, and live latency.
 
-```text
-https://player01.cockxing.online/app/linear/master.m3u8
-```
+## 14. Operations, incidents, and routine checks
 
-2. Confirm video and audio begin, then inspect the browser/player network requests. The playlist and `.m4s` media requests must use `player01.cockxing.online`, never `origin01.cockxing.online`.
-3. Test from every significant viewer region and record startup time, rebuffer count, and live latency.
-4. If CORS errors occur, replace `https://player01.cockxing.online` in OME's `<CrossDomains>` section with the exact origin of the webpage that embeds the player, then restart OME:
+**Location: Origin SSH terminal for commands; Bunny dashboard for CDN metrics**
 
-```bash
-cd ~/ome
-sudo docker compose restart ome
-```
-
-**Location: Origin SSH terminal for the restart command above.**
-
-## 11. Operate safely
-
-**Location: Origin SSH terminal for the commands; Bunny dashboard for CDN metrics.**
-
-Run these checks after deployment and during an incident:
+Run these commands after deployment and when investigating an incident:
 
 ```bash
 cd ~/ome
@@ -572,7 +649,25 @@ sudo docker compose logs --tail=200 caddy
 sudo docker stats --no-stream
 ```
 
-Monitor vMix output, SRT loss/retransmissions, OME logs, CPU/RAM/network, Bunny cache-hit ratio, 4xx/5xx rates, delivery by region, and playback probes from target continents. Rehearse encoder restart, VM restart, certificate renewal, token expiry, and primary-to-standby failover before a live event.
+Monitor:
+
+- vMix output status, SRT loss, and retransmissions.
+- OME logs, CPU, memory, and network use.
+- Caddy certificate/HTTP errors.
+- Bunny cache-hit ratio, 4xx/5xx rates, regional delivery, bandwidth alerts, and playback probes from target continents.
+
+| Symptom | First checks |
+|---|---|
+| vMix cannot connect | Confirm the vMix public IP still matches the UDP 9999 cloud-firewall rule, then verify host, port, stream ID, passphrase, and latency. |
+| OME receives no stream | Inspect `docker compose logs ome`; confirm vMix uses `default/app/linear`, H.264, and AAC. |
+| Caddy certificate fails | Confirm `origin01` DNS resolves correctly and inbound TCP 80/443 reaches the VM. |
+| Origin returns a playlist publicly | Stop and correct Caddy's `X-Origin-Verify` matcher before proceeding. |
+| Bunny returns 404 | Confirm Origin URL, Origin Host Header, Edge Rule header, Caddy secret, and live stream path. |
+| Viewer gets 403 | Check Bunny token validity/expiry and any geographic or referrer rule. |
+| Browser CORS error | Add the exact scheme + hostname of the embedding page to OME `<CrossDomains>`, then restart OME. |
+| High live latency | Measure the vMix-to-origin SRT path, player live buffer, distance to origin, and Origin Shield effect before changing LL-HLS settings. |
+
+Before a live event, rehearse encoder restart, VM restart, certificate renewal, token expiry, and primary-to-standby failover. Verify recovery on real devices and networks, not just from the origin region.
 
 ## References
 
