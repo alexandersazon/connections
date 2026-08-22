@@ -63,8 +63,8 @@ Calculate the bill from the expected regional traffic mix. An even four-region s
 | Location label | Use it for |
 |---|---|
 | **Cloudflare dashboard** | DNS records in the `cockxing.online` zone only. |
-| **Akamai Cloud Manager** | Account, region, firewall, and VM review. |
-| **Administrator workstation** | A local terminal with the Linode CLI authenticated to the Akamai Cloud account. |
+| **Akamai Cloud Manager** | Account, region, Cloud Firewall, reserved IP, SSH-key, and VM configuration. |
+| **Administrator workstation** | A local terminal used to create/access the SSH key and connect to the origin. No Linode CLI is required. |
 | **Origin SSH terminal** | An SSH session to the Ubuntu VM, initially as `root` and then as `deploy`. |
 | **Bunny dashboard** | Pull Zone, custom hostname, Edge Rules, token authentication, and metrics. |
 | **vMix PC** | The Windows machine running vMix. |
@@ -75,7 +75,7 @@ Calculate the bill from the expected regional traffic mix. An even four-region s
 Before provisioning, confirm all of the following:
 
 - You control the `cockxing.online` DNS zone in Cloudflare.
-- You have an Akamai Cloud account, an administrator SSH public key, and an authenticated Linode CLI.
+- You have an Akamai Cloud account and an administrator SSH public key that you can add to Cloud Manager.
 - You know the administrator and vMix source public IP ranges. If either location uses changing IPs, use a fixed VPN egress range instead.
 - Ports 80 and 443 may be publicly reached during Caddy certificate issuance and by Bunny. UDP 9999 may be reached only from the vMix CIDR.
 - You have a Bunny account and authority to create a Pull Zone and custom hostname.
@@ -83,39 +83,23 @@ Before provisioning, confirm all of the following:
 
 ## 5. Phase 1 - Create the origin VM and public DNS
 
-### 5.1 Choose the region and administrator access
+### 5.1 Choose the region and prepare administrator access
 
 **Location: Akamai Cloud Manager and Administrator workstation**
 
-1. Select the Akamai Cloud account that will own the origin.
-2. Choose the region nearest vMix. Replace `YOUR_AKAMAI_REGION` below with that region.
-3. Create or select the administrator SSH key pair. Its public key is installed during provisioning.
-4. Install and authenticate the Linode CLI if necessary:
+1. Sign in to [Akamai Cloud Manager](https://cloud.linode.com/) and select the account that will own the origin.
+2. Choose the region nearest vMix. The origin should be close to the encoder; Bunny handles global viewer delivery.
+3. Create or locate an administrator SSH key pair on the workstation. Keep the private key only on the workstation. The public key normally has a `.pub` suffix, for example `id_ed25519.pub`.
+4. In Cloud Manager, select your profile name -> **SSH Keys** -> **Add an SSH Key**. Give the key a descriptive label, paste the public-key contents, and save it. You will select this key during VM creation.
+5. Record the administrator and vMix IPv4 CIDRs in the deployment worksheet. A single IPv4 address must use `/32`, for example `203.0.113.10/32`.
 
-```bash
-linode-cli configure
-```
+### 5.2 Create the Cloud Firewall
 
-5. Record the administrator and vMix IPv4 CIDRs in the deployment worksheet.
+**Location: Akamai Cloud Manager**
 
-### 5.2 Create the cloud firewall
-
-**Location: Administrator workstation. Working directory: home directory (`~`)**
-
-1. Set the variables. Replace every uppercase placeholder before continuing.
-
-```bash
-REGION="YOUR_AKAMAI_REGION"
-INSTANCE="ome-origin01"
-TAG="ome-origin"
-TYPE="g6-standard-2"
-IMAGE="linode/ubuntu24.04"
-SSH_PUBLIC_KEY="$HOME/.ssh/id_ed25519.pub"
-ADMIN_CIDR="YOUR_ADMIN_PUBLIC_IP/32"
-VMIX_CIDR="YOUR_VMIX_PUBLIC_IP/32"
-```
-
-2. Create a default-deny firewall. The permitted inbound paths are intentional:
+1. From the navigation menu, open **Firewalls**, choose **Create Firewall**, and name it `ome-origin01-fw`.
+2. On the firewall's **Rules** page, set the default **Inbound Policy** to **Drop** and the default **Outbound Policy** to **Accept**.
+3. Add the three inbound **Accept** rules in the table below. For a public web rule, use the UI's all-IPv4 and all-IPv6 source option, or enter `0.0.0.0/0` and `::/0` if it requests CIDRs. Use the exact administrator and vMix CIDRs from the worksheet for the restricted rules.
 
 | Protocol/port | Source | Purpose |
 |---|---|---|
@@ -124,55 +108,40 @@ VMIX_CIDR="YOUR_VMIX_PUBLIC_IP/32"
 | UDP 9999 | vMix CIDR only | SRT contribution |
 | All other inbound | Any | Deny |
 
-```bash
-linode-cli firewalls create \
-  --label ome-origin01-fw \
-  --rules.outbound_policy ACCEPT \
-  --rules.inbound_policy DROP \
-  --rules.inbound '[{"protocol":"TCP","ports":"22","addresses":{"ipv4":["'"$ADMIN_CIDR"'"]},"action":"ACCEPT","label":"ssh-admin"},{"protocol":"TCP","ports":"80,443","addresses":{"ipv4":["0.0.0.0/0"],"ipv6":["::/0"]},"action":"ACCEPT","label":"web"},{"protocol":"UDP","ports":"9999","addresses":{"ipv4":["'"$VMIX_CIDR"'"]},"action":"ACCEPT","label":"srt-vmix"}]'
-```
+4. Click **Save Changes** after adding the rules. Cloud Firewall rule changes do not take effect until they are saved.
+5. Do not add rules for TCP 1935 or TCP 3333. RTMP is not used and OME's playback port must stay private.
 
-3. Copy the firewall ID from the response and create the VM. `legacy_config` lets `--firewall_id` attach the firewall directly. If your account uses Linode Interfaces, create the VM in Akamai Cloud Manager and attach this firewall to its public interface.
+### 5.3 Reserve an IPv4 address and create the VM
 
-```bash
-FIREWALL_ID="YOUR_FIREWALL_ID"
+**Location: Akamai Cloud Manager**
 
-linode-cli linodes create \
-  --label "$INSTANCE" \
-  --region "$REGION" \
-  --type "$TYPE" \
-  --image "$IMAGE" \
-  --authorized_keys "$(cat "$SSH_PUBLIC_KEY")" \
-  --firewall_id "$FIREWALL_ID" \
-  --interface_generation legacy_config \
-  --tags "$TAG" \
-  --booted true
-```
+1. Open **Reserved IPs** from the navigation menu, then choose **Reserve an IP Address**.
+2. Select the same region chosen for the VM, optionally add the `ome-origin` tag, and reserve the address. A reserved IP is billed while it remains reserved, including when unassigned, but remains available to your account if the VM is later deleted.
+3. Copy the assigned address into the worksheet as `ORIGIN_IPV4`.
+4. Open the **Create** menu in the top bar and select **Linode**.
+5. Configure the form as follows:
 
-4. Copy the VM ID and public IPv4 from the response. Reserve that IPv4 so it remains allocated to your account even if the VM is deleted.
+| Create-Linode setting | Value |
+|---|---|
+| Region | The region chosen in step 5.1 |
+| Image | Ubuntu 24.04 LTS |
+| Plan | A Shared CPU plan with 2 vCPU and 4 GB RAM (the API plan is `g6-standard-2`) |
+| Label | `ome-origin01` |
+| Tags | `ome-origin` |
+| SSH keys | Select the administrator key added in step 5.1 |
+| Public Internet / IPv4 | Choose **Reserved** and select `ORIGIN_IPV4` |
+| Cloud Firewall | Select `ome-origin01-fw` for the public interface |
 
-```bash
-LINODE_ID="YOUR_LINODE_ID_FROM_CREATE_OUTPUT"
-ORIGIN_IPV4="YOUR_PUBLIC_IPV4_FROM_CREATE_OUTPUT"
+6. Leave a root password blank when Cloud Manager permits password-less provisioning with an SSH key. This is preferred. Do not add a Quick Deploy app, StackScript, or unrelated interface.
+7. Click **Create Linode** and wait until its status is **Running**.
+8. Open the new Linode's detail page and confirm its public IPv4 is the reserved `ORIGIN_IPV4`, its region and plan are correct, and `ome-origin01-fw` is attached to the public interface.
 
-linode-cli networking ip-update "$ORIGIN_IPV4" --reserved true
-linode-cli linodes view "$LINODE_ID" --format "id,label,status,ipv4,region,type"
-```
-
-5. Review before proceeding:
-
-```bash
-linode-cli firewalls view "$FIREWALL_ID"
-```
-
-Do not add rules for TCP 1935 or TCP 3333. RTMP is not used and OME's playback port must stay private.
-
-### 5.3 Create the origin DNS record
+### 5.4 Create the origin DNS record
 
 **Location: Cloudflare dashboard -> `cockxing.online` -> DNS -> Records**
 
 1. Choose **Add record**.
-2. Create an `A` record with **Name** `origin01` and the reserved `ORIGIN_IPV4` address.
+2. Create an `A` record with **Name** `origin01` and the reserved `ORIGIN_IPV4` address from step 5.3.
 3. Set **Proxy status** to **DNS only** (grey cloud), then save. Do not orange-cloud it: Bunny must connect to Caddy directly, and Caddy must complete its own TLS challenge.
 4. Use a temporary TTL such as 300 seconds while testing, if Cloudflare presents that option.
 5. Do not create `player01` here yet. It is created later as a Bunny-directed CNAME.
@@ -183,7 +152,7 @@ Do not add rules for TCP 1935 or TCP 3333. RTMP is not used and OME's playback p
 ssh root@origin01.cockxing.online
 ```
 
-If SSH fails, verify that the workstation's current public IP is inside `ADMIN_CIDR` and that the cloud firewall is attached to the VM.
+If SSH fails, verify that the workstation's current public IP is inside the administrator CIDR and that the Cloud Firewall is attached to the VM's public interface.
 
 ## 6. Phase 2 - Prepare and secure Ubuntu
 
@@ -672,9 +641,7 @@ Before a live event, rehearse encoder restart, VM restart, certificate renewal, 
 ## References
 
 - [Akamai Cloud create a compute instance](https://techdocs.akamai.com/cloud-computing/docs/create-a-compute-instance)
-- [Akamai Linode CLI](https://techdocs.akamai.com/cloud-computing/docs/getting-started-with-the-linode-cli)
-- [Akamai create a Linode API/CLI reference](https://techdocs.akamai.com/linode-api/reference/post-linode-instance)
-- [Akamai Cloud Firewall API/CLI reference](https://techdocs.akamai.com/linode-api/reference/post-firewalls)
+- [Akamai Cloud Firewall rules](https://techdocs.akamai.com/cloud-computing/docs/manage-firewall-rules)
 - [Akamai reserved IPs](https://techdocs.akamai.com/cloud-computing/docs/reserved-ips)
 - [Cloudflare proxy status](https://developers.cloudflare.com/dns/proxy-status/)
 - [Cloudflare proxying limitations](https://developers.cloudflare.com/dns/proxy-status/limitations/)
