@@ -90,7 +90,26 @@ Before provisioning, confirm all of the following:
 1. Sign in to [Akamai Cloud Manager](https://cloud.linode.com/) and select the account that will own the origin.
 2. Choose the region nearest vMix. The origin should be close to the encoder; Bunny handles global viewer delivery.
 3. Create or locate an administrator SSH key pair on the workstation. Keep the private key only on the workstation. The public key normally has a `.pub` suffix, for example `id_ed25519.pub`.
-4. In Cloud Manager, select your profile name -> **SSH Keys** -> **Add an SSH Key**. Give the key a descriptive label, paste the public-key contents, and save it. You will select this key during VM creation.
+
+   **Windows administrator workstation - create a new key pair**
+
+   1. Open PowerShell and run the following command. Replace the comment value with an identifier for the key owner/workstation:
+
+      ```powershell
+      ssh-keygen -t ed25519 -a 100 -C "your-name@admin-workstation"
+      ```
+
+   2. At the file-location prompt, press `Enter` to use the default path, normally `C:\Users\<your-user>\.ssh\id_ed25519`. If that file already exists, do **not** overwrite it unless you intentionally want to replace that key.
+   3. Enter and confirm a strong passphrase when prompted.
+   4. Display the public key and copy the complete single line that begins with `ssh-ed25519`:
+
+      ```powershell
+      Get-Content "$env:USERPROFILE\.ssh\id_ed25519.pub"
+      ```
+
+   5. Copy only the `.pub` file contents. Never upload, paste, or share the matching `id_ed25519` file without the `.pub` suffix; it is the private key.
+
+4. In Cloud Manager, select your profile name -> **SSH Keys** -> **Add an SSH Key**. Give the key a descriptive label, paste the public-key contents copied above, and save it. You will select this key during VM creation.
 5. Record the administrator and vMix IPv4 CIDRs in the deployment worksheet. A single IPv4 address must use `/32`, for example `203.0.113.10/32`.
 
 ### 5.2 Create the Cloud Firewall
