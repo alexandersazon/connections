@@ -173,6 +173,14 @@ ssh root@origin01.cockxing.online
 
 If SSH fails, verify that the workstation's current public IP is inside the administrator CIDR and that the Cloud Firewall is attached to the VM's public interface.
 
+> **SSH key troubleshooting:** The initial account is `root`; the `deploy` account does not exist until Phase 2. SSH uses the private key matching the administrator public key selected when creating the VM, so no root password is required. If Windows returns `Permission denied (publickey)`, confirm the matching key is available with `Get-ChildItem $HOME\.ssh`, then specify it explicitly:
+>
+> ```powershell
+> ssh -i $HOME\.ssh\YOUR_PRIVATE_KEY root@origin01.cockxing.online
+> ```
+>
+> After the deployment-account commands below have completed, use the same key to connect as `deploy`.
+
 ## 6. Phase 2 - Prepare and secure Ubuntu
 
 ### 6.1 Create a deployment account
@@ -207,9 +215,10 @@ Do not run a blanket OS upgrade during a production build. Install only the requ
 
 ```bash
 sudo apt update
-sudo apt install -y docker.io docker-compose-plugin curl openssl ufw
+sudo apt install -y docker.io docker-compose-v2 curl openssl ufw
 sudo systemctl enable --now docker
-sudo install -d -m 750 "$HOME/ome/config" "$HOME/ome/caddy"
+sudo install -d -m 750 -o deploy -g deploy "$HOME/ome/config" "$HOME/ome/caddy"
+docker compose version
 ```
 
 Optional defence in depth: add UFW rules. The Akamai Cloud Firewall remains the authoritative control because Docker networking can bypass host-firewall assumptions. Replace the placeholders before execution.
@@ -241,7 +250,20 @@ pwd
 
 Never put this value in source control, chat, screenshots, browser code, or a public ticket.
 
-**Phase 2 gate:** `~/ome/config`, `~/ome/caddy`, and a mode-`600` secret file exist under the `deploy` account.
+### 6.4 Generate the SRT passphrase
+
+**Location: Origin SSH terminal**
+
+Generate a separate passphrase for the encrypted vMix-to-OME SRT connection. You will paste this exact value into OME in Phase 3 and vMix in Phase 5.
+
+```bash
+openssl rand -hex 32 | tee "$HOME/ome/config/srt-passphrase.txt"
+chmod 600 "$HOME/ome/config/srt-passphrase.txt"
+```
+
+Never put this value in source control, chat, screenshots, browser code, or a public ticket.
+
+**Phase 2 gate:** `~/ome/config`, `~/ome/caddy`, and the two mode-`600` secret files exist under the `deploy` account.
 
 ## 7. Phase 3 - Configure OME
 
@@ -253,7 +275,7 @@ Never put this value in source control, chat, screenshots, browser code, or a pu
 nano ~/ome/config/Server.xml
 ```
 
-2. Paste the following configuration, then save (`Ctrl+O`, `Enter`) and exit (`Ctrl+X`).
+2. Run `cat ~/ome/config/srt-passphrase.txt`, then paste its value in place of `PASTE_THE_SRT_PASSPHRASE` below. Paste the following configuration, then save (`Ctrl+O`, `Enter`) and exit (`Ctrl+X`).
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -268,7 +290,14 @@ nano ~/ome/config/Server.xml
   </Modules>
   <Bind>
     <Providers>
-      <SRT><Port>9999</Port><WorkerCount>1</WorkerCount></SRT>
+      <SRT>
+        <Port>9999</Port>
+        <WorkerCount>1</WorkerCount>
+        <Options>
+          <Option><Key>SRTO_PBKEYLEN</Key><Value>32</Value></Option>
+          <Option><Key>SRTO_PASSPHRASE</Key><Value>PASTE_THE_SRT_PASSPHRASE</Value></Option>
+        </Options>
+      </SRT>
     </Providers>
     <Publishers>
       <LLHLS><Port>3333</Port><WorkerCount>1</WorkerCount></LLHLS>
@@ -419,12 +448,14 @@ curl -I https://origin01.cockxing.online/app/linear/master.m3u8
 **Location: vMix PC**
 
 1. Open the production preset.
-2. Click the gear beside **Stream**, select an unused destination, choose **SRT**, and use **Caller** mode.
-3. Enter these values. Enable encryption in the appropriate pane if the vMix version places it elsewhere.
+2. Do **not** use the gear beside **Stream**: that dialog configures RTMP destinations and does not offer SRT.
+3. In the main vMix window, open **Settings** -> **Outputs / NDI / OMT / SRT** (the tab may be named **Outputs / NDI / SRT** in earlier releases).
+4. Choose an output channel, normally **Output 1** for the Program feed, and click its cog/settings button. Tick **Enable SRT**, then set the type to **Caller**.
+5. Enter these values, click **OK** to save the output settings, then click the **SRT** button in the main vMix window to start the contribution.
 
 | vMix setting | Value |
 |---|---|
-| Host | Origin VM public IP or a dedicated ingest DNS name |
+| Hostname | Origin VM public IP or a dedicated ingest DNS name |
 | Port | `9999` |
 | Stream ID | `default/app/linear` |
 | Latency | Start at `120 ms`; raise it if WAN loss/jitter appears |
@@ -433,7 +464,9 @@ curl -I https://origin01.cockxing.online/app/linear/master.m3u8
 | Audio | AAC-LC, 128 Kbps |
 | Keyframe interval | 2 seconds |
 
-If vMix accepts a single SRT URL, use this format. Substitute the Akamai origin IP and SRT secret; keep the `streamid` query parameter.
+If your vMix release does not show **Enable SRT**, update to vMix 23 or newer. Configure the individual fields above; vMix's SRT output dialog does not require a single URL.
+
+For reference, the equivalent SRT URL is below. Substitute the Akamai origin IP and SRT secret; keep the `streamid` query parameter.
 
 ```text
 srt://ORIGIN_STATIC_IP:9999?streamid=default/app/linear&passphrase=YOUR_SRT_SECRET&pbkeylen=32
