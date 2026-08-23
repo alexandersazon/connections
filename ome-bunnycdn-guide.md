@@ -21,7 +21,7 @@ The stream path has three trust boundaries:
 
 Important:
 
-- This design uses LL-HLS. The playback playlist is `master.m3u8`; do not use `index.m3u8` or a `ts:` URL.
+- This design uses LL-HLS. With the pinned OME image, the playback playlist is `llhls.m3u8`; do not use `index.m3u8` or a `ts:` URL.
 - OME does no transcoding. vMix must produce H.264 video and AAC audio.
 - The Cloudflare origin record is **DNS only**. This exposes the origin IP, so use this VM only for this streaming service and retain every firewall/header control below.
 - CDN delivery is global, but the origin should be close to the vMix encoder. Distance to the origin can increase live latency on an edge-cache miss.
@@ -440,7 +440,7 @@ Expected result: both services are running and Caddy has obtained a TLS certific
 Run this unauthenticated request:
 
 ```bash
-curl -I https://origin01.cockxing.online/app/linear/master.m3u8
+curl -I https://origin01.cockxing.online/app/linear/llhls.m3u8
 ```
 
 **Phase 4 gate:** The response is `404`, not a playlist. Do not continue if stream content is publicly available from the origin.
@@ -570,7 +570,7 @@ A `403` or `404` at `/` is expected because root access is blocked. A valid HTTP
 **Phase 6 gate:** From an external device, open the viewer URL in an LL-HLS-capable player or test page:
 
 ```text
-https://player01.cockxing.online/app/linear/master.m3u8
+https://player01.cockxing.online/app/linear/llhls.m3u8
 ```
 
 Video and audio should begin. Browser/player requests for both the playlist and `.m4s` files must go to `player01.cockxing.online`, never `origin01.cockxing.online`.
@@ -600,7 +600,7 @@ For each viewing session:
 
 | Signer input | Value |
 |---|---|
-| Base URL | `https://player01.cockxing.online/app/linear/master.m3u8` |
+| Base URL | `https://player01.cockxing.online/app/linear/llhls.m3u8` |
 | Token type | Path-based directory token |
 | Token path | `/app/linear/` |
 | Expiry | 5-15 minutes, matching the viewing-session design |
@@ -658,7 +658,7 @@ Country blocking is enforced by Bunny using the viewer's IP geolocation. It appl
 1. Open **CDN -> Pull Zones -> `player01`** and find **Blocked Countries** under Security or geographic restrictions.
 2. Add the target ISO 3166-1 alpha-2 country code. `XX` is only a placeholder; replace it with a real code.
 3. Save and enable it. Do not disable the matching global delivery region: disabling a region may reroute rather than block the viewer.
-4. Test from a reputable exit node in the blocked country and an allowed country. The blocked case should receive `403` for both `master.m3u8` and `.m4s` requests.
+4. Test from a reputable exit node in the blocked country and an allowed country. The blocked case should receive `403` for both `llhls.m3u8` and `.m4s` requests.
 5. Record the business/legal reason, approver, date, and review date. IP geolocation can be bypassed by VPNs and is not legal advice.
 
 If country access must vary per viewer, do not use a Pull-Zone-wide block. Instead, have the server-side directory-token signer use `token_countries` or `token_countries_blocked` for that viewer.
