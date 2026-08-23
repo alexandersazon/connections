@@ -370,13 +370,15 @@ nano ~/ome/caddy/Caddyfile
 origin01.cockxing.online {
     @bunny header X-Origin-Verify "PASTE_THE_SECRET_FROM_THE_FILE"
     handle @bunny {
-        reverse_proxy ome:3333
+        reverse_proxy ome:3333 {
+            header_up -X-Origin-Verify
+        }
     }
     respond "Not found" 404
 }
 ```
 
-Any request that omits or mismatches the header gets `404`; OME is not directly exposed.
+Any request that omits or mismatches the header gets `404`; OME is not directly exposed. Caddy removes the verification header before proxying so the secret is not written into OME request logs.
 
 ### 8.2 Create and launch Docker Compose
 
@@ -493,24 +495,24 @@ Stop following the log with `Ctrl+C` after the stream appears. The external orig
 
 **Location: Bunny dashboard**
 
-1. Open **CDN -> Pull Zones -> Add Pull Zone**.
-2. Name it `player01`, or use another unique descriptive name.
-3. Set **Origin URL** to `https://origin01.cockxing.online`.
-4. Select the **Standard** tier and enable delivery regions needed by the audience: Europe/North America, Asia/Oceania, South America, and Middle East/Africa.
-5. Create the zone.
-6. Set **Origin Host Header** to `origin01.cockxing.online`, and keep origin SSL verification enabled.
-7. Enable Origin Shield in a location close to the origin. Measure worldwide playback and disable it only if it demonstrably misses the live-latency requirement.
-8. Enable request coalescing, block root-path access and POST requests, and set a monthly bandwidth limit/alert.
+1. In the Bunny dashboard, click **+ Add** in the sidebar, then choose **Pull Zone**. (You can also open **CDN** and select **Add Pull Zone**.)
+2. Enter the Pull Zone name `player01`, or another unique alphanumeric name. This creates the temporary hostname `NAME.b-cdn.net`.
+3. For **Origin type**, choose **Origin URL**. Enter `https://origin01.cockxing.online` for **Origin URL** and `origin01.cockxing.online` for the optional **Host header**.
+4. Choose the **Standard** tier and select the delivery regions required by the audience: Europe/North America, Asia/Oceania, South America, and Middle East/Africa.
+5. Click **Add Pull Zone** to create it.
+6. Open the new Pull Zone. In **General**, confirm its origin URL and Host header, and retain origin SSL verification.
+7. In **Caching**, enable **Request Coalescing**. In the applicable General/Security controls, block root-path access and POST requests, and set a monthly bandwidth limit/alert.
+8. Optionally enable **Origin Shield** in a location close to the origin. Measure worldwide playback and disable it only if it demonstrably misses the live-latency requirement.
 
 ### 10.2 Add the Bunny-to-origin secret header
 
 **Location: Bunny dashboard**
 
-1. In the Pull Zone, open **Edge Rules** and add a rule that applies to every request.
-2. Select **Set Request Header**.
-3. Set the header name to `X-Origin-Verify`.
-4. Set its value to the exact value in `~/ome/caddy/origin-header-secret.txt`.
-5. Save and enable the rule.
+1. In the Pull Zone, open the **Edge Rules** tab and click **Add Edge Rule**.
+2. Set **Action** to **Set Request Header**.
+3. Set the header name to `X-Origin-Verify` and the header value to the exact value in `~/ome/caddy/origin-header-secret.txt`.
+4. Add a trigger/condition that matches every viewer request. Use **Request URL** with the value `*` (or the UI's equivalent match-all option).
+5. Save the rule, confirm it is enabled, and keep it ahead of any conflicting origin-routing rules.
 
 The value must remain a request secret. Never send it as a response header and never include it in browser code.
 
@@ -518,8 +520,8 @@ The value must remain a request secret. Never send it as a response header and n
 
 **Location: Bunny dashboard, then Cloudflare dashboard -> `cockxing.online` -> DNS -> Records**
 
-1. In the Pull Zone custom-hostname area, add `player01.cockxing.online`.
-2. Copy the exact CNAME target Bunny displays.
+1. In the Pull Zone's **General** section, find the **Hostnames** panel. Enter `player01.cockxing.online` and click **Add hostname**.
+2. Copy the exact CNAME record value shown below the hostname field.
 3. In Cloudflare, add a `CNAME` record with **Name** `player01` and **Target** equal to Bunny's displayed target. Do not guess the target and do not point this record at the origin VM.
 4. Set Cloudflare **Proxy status** to **DNS only** (grey cloud) and save. Orange-clouding another CDN can introduce certificate or connectivity failures and inserts Cloudflare in front of Bunny.
 5. Return to Bunny and wait for the custom-hostname certificate to become active.
@@ -538,10 +540,31 @@ A `403` or `404` at `/` is expected because root access is blocked. A valid HTTP
 
 **Location: Bunny dashboard**
 
-1. Add an extension cache rule for `.m3u8`: edge TTL `0`/do not cache; browser cache `no-store`.
-2. Add an extension cache rule for `.m4s`: edge and browser TTL `10 minutes`.
-3. Do **not** globally ignore query strings when token authentication is used.
-4. For a non-public stream, enable **Advanced Token Authentication**. Use short-lived path-based directory tokens for `/app/linear/`, created only by a server-side application. Directory tokens let the playlist's relative media requests retain authorization.
+1. In **Edge Rules**, click **Add Edge Rule** and create the playlist rule with these exact form values. If the dashboard displays a unit selector, choose **Seconds**.
+
+| Field | Value |
+|---|---|
+| Description | `playlistcache` |
+| Action 1 | **Override Cache Time**: `0` seconds |
+| Action 2 | **Override Browser Cache Time**: `0` seconds |
+| Condition group | `IF` -> **Match any** |
+| Condition | **Request URL** |
+| Request URL value/pattern | `*.m3u8` |
+
+   This bypasses edge and browser caching for live playlists.
+2. Click **Add Edge Rule** again and create the media-segment rule with these exact form values.
+
+| Field | Value |
+|---|---|
+| Description | `segmentcache` |
+| Action 1 | **Override Cache Time**: `600` seconds |
+| Action 2 | **Override Browser Cache Time**: `600` seconds |
+| Condition group | `IF` -> **Match any** |
+| Condition | **Request URL** |
+| Request URL value/pattern | `*.m4s` |
+
+3. Do **not** enable any global **Ignore Query Strings** setting when token authentication is used.
+4. For a non-public stream, enable **Advanced Token Authentication** in the Pull Zone's **Security** settings. Use short-lived path-based directory tokens for `/app/linear/`, created only by a server-side application. Directory tokens let the playlist's relative media requests retain authorization.
 5. Treat allowed-referrer rules as a deterrent/cost control, not authentication.
 
 **Phase 6 gate:** From an external device, open the viewer URL in an LL-HLS-capable player or test page:
