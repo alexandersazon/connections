@@ -606,13 +606,33 @@ Paste the following. It uses the same-host HLS path by default. If Bunny token a
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Live player</title>
   <style>
-    .player { background: #000; color: #fff; max-width: 960px; position: relative; }
+    html, body { background: #000; margin: 0; padding: 0; }
+    .player {
+      background: transparent; border: 0; color: #fff; font-family: Arial, sans-serif;
+      margin: 0; max-width: 960px; padding: 0; position: relative;
+    }
     .video-frame { aspect-ratio: 16 / 9; position: relative; }
     video { aspect-ratio: 16 / 9; display: block; object-fit: contain; width: 100%; }
-    .controls { align-items: center; display: flex; gap: .75rem; padding: .75rem; }
+    .controls {
+      align-items: center; background: rgb(0 0 0 / 50%); bottom: 0; display: flex;
+      gap: .75rem; left: 0; padding: .75rem; position: absolute; right: 0;
+      transition: opacity .3s ease;
+    }
+    .player.controls-hidden .controls { opacity: 0; pointer-events: none; }
+    .player:fullscreen { background: #000; max-width: none; width: 100%; }
     .controls button, .controls select { font: inherit; }
+    .controls .icon-button {
+      align-items: center; background: transparent; border: 0; color: #fff; cursor: pointer;
+      display: inline-flex; height: 2rem; justify-content: center; padding: .25rem; width: 2rem;
+    }
+    .controls .icon-button:hover, .controls .icon-button:focus-visible { background: rgb(255 255 255 / 20%); }
+    .controls .icon-button svg { fill: none; height: 1.35rem; stroke: currentColor; stroke-linecap: round;
+      stroke-linejoin: round; stroke-width: 2; width: 1.35rem; }
     [hidden] { display: none !important; }
-    #liveStatus { color: #ff4d4f; font-weight: 700; }
+    #liveStatus {
+      background: #22c55e; border-radius: 50%; box-shadow: 0 0 6px #22c55e;
+      display: inline-block; height: .7rem; width: .7rem;
+    }
     #streamStatus {
       align-items: center; background: #000; display: flex; font-weight: 700;
       inset: 0; justify-content: center; letter-spacing: .04em; position: absolute;
@@ -628,12 +648,14 @@ Paste the following. It uses the same-host HLS path by default. If Bunny token a
     </div>
     <div class="controls" aria-label="Player controls">
       <button id="playButton" type="button" aria-label="Play live stream">Play</button>
-      <span id="liveStatus" aria-live="polite">LIVE</span>
+      <button id="muteButton" class="icon-button" type="button" aria-label="Unmute live stream"></button>
+      <span id="liveStatus" aria-label="Live" aria-live="polite"></span>
       <span id="time" aria-live="off">--:--</span>
       <label id="resolutionControl">
         Resolution
         <select id="resolution" aria-label="Resolution"><option value="-1">Auto</option></select>
       </label>
+      <button id="fullscreenButton" class="icon-button" type="button" aria-label="Enter full screen"></button>
     </div>
   </div>
 
@@ -641,29 +663,82 @@ Paste the following. It uses the same-host HLS path by default. If Bunny token a
   <script>
     const settings = {
       showPlayButton: false,       // Set true to show the Play/Pause button.
+      showMuteButton: true,        // Set false to hide the Mute/Unmute button.
       showTime: false,             // Set true to show the live-edge time display.
-      showResolutionMenu: true     // It is hidden automatically for a single rendition.
+      showResolutionMenu: true,    // It is hidden automatically for a single rendition.
+      showFullscreenButton: true   // Set false to hide the Full screen button.
     };
     const playbackUrl = '/app/linear/llhls.m3u8';
+    const player = document.querySelector('#player');
     const video = document.querySelector('#video');
     const playButton = document.querySelector('#playButton');
+    const muteButton = document.querySelector('#muteButton');
     const time = document.querySelector('#time');
     const liveStatus = document.querySelector('#liveStatus');
     const streamStatus = document.querySelector('#streamStatus');
     const resolutionControl = document.querySelector('#resolutionControl');
     const resolution = document.querySelector('#resolution');
+    const fullscreenButton = document.querySelector('#fullscreenButton');
     const retryDelayMs = 10000;
+    const controlsHideDelayMs = 2500;
     let hls;
     let retryTimer;
+    let controlsTimer;
     let usingNativeHls = false;
 
     playButton.hidden = !settings.showPlayButton;
+    muteButton.hidden = !settings.showMuteButton;
     time.hidden = !settings.showTime;
     resolutionControl.hidden = !settings.showResolutionMenu;
+    fullscreenButton.hidden = !settings.showFullscreenButton;
+
+    function showControls() {
+      player.classList.remove('controls-hidden');
+      clearTimeout(controlsTimer);
+      controlsTimer = setTimeout(function () {
+        player.classList.add('controls-hidden');
+      }, controlsHideDelayMs);
+    }
+
+    player.addEventListener('pointermove', showControls);
+    player.addEventListener('pointerdown', showControls);
+    player.addEventListener('focusin', showControls);
+    player.addEventListener('keydown', showControls);
 
     function syncPlayButton() {
       playButton.textContent = video.paused ? 'Play' : 'Pause';
       playButton.setAttribute('aria-label', playButton.textContent + ' live stream');
+    }
+
+    function syncMuteButton() {
+      const label = video.muted ? 'Unmute' : 'Mute';
+      muteButton.innerHTML = video.muted
+        ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="m16 9 5 5m0-5-5 5"/></svg>'
+        : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15.5 9.5a4 4 0 0 1 0 5m2.5-7.5a7 7 0 0 1 0 10"/></svg>';
+      muteButton.setAttribute('aria-label', label + ' live stream');
+    }
+
+    function toggleMute() {
+      video.muted = !video.muted;
+      if (!video.muted) video.play().catch(function () {});
+      syncMuteButton();
+    }
+
+    function syncFullscreenButton() {
+      const inFullscreen = document.fullscreenElement === player;
+      const label = inFullscreen ? 'Exit full screen' : 'Enter full screen';
+      fullscreenButton.innerHTML = inFullscreen
+        ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4v5H4m11-5v5h5M9 20v-5H4m16 0h-5v5"/></svg>'
+        : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5m6 0h5v5M4 15v5h5m11-5v5h-5"/></svg>';
+      fullscreenButton.setAttribute('aria-label', label);
+    }
+
+    function toggleFullscreen() {
+      if (document.fullscreenElement) {
+        document.exitFullscreen();
+      } else {
+        player.requestFullscreen().catch(function () {});
+      }
     }
 
     function updateTime() {
@@ -766,17 +841,24 @@ Paste the following. It uses the same-host HLS path by default. If Bunny token a
     }
 
     playButton.addEventListener('click', togglePlayback);
+    muteButton.addEventListener('click', toggleMute);
+    fullscreenButton.addEventListener('click', toggleFullscreen);
     video.addEventListener('click', function () {
-      // The first viewer click enables sound; later clicks toggle play/pause.
+      // Clicking the video only enables sound; it never pauses the live stream.
       if (video.muted) {
         video.muted = false;
         video.play().catch(function () {});
-      } else {
-        togglePlayback();
+        syncMuteButton();
       }
     });
-    video.addEventListener('play', syncPlayButton);
-    video.addEventListener('pause', syncPlayButton);
+    video.addEventListener('play', function () {
+      syncPlayButton();
+      showControls();
+    });
+    video.addEventListener('pause', function () {
+      syncPlayButton();
+      showControls();
+    });
     video.addEventListener('timeupdate', updateTime);
     video.addEventListener('progress', updateTime);
     video.addEventListener('loadedmetadata', function () {
@@ -790,7 +872,11 @@ Paste the following. It uses the same-host HLS path by default. If Bunny token a
     resolution.addEventListener('change', function () {
       if (hls) hls.currentLevel = Number(resolution.value); // -1 restores adaptive Auto quality.
     });
+    document.addEventListener('fullscreenchange', syncFullscreenButton);
 
+    syncMuteButton();
+    syncFullscreenButton();
+    showControls();
     startStream();
   </script>
 </body>
