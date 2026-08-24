@@ -268,15 +268,37 @@ Never put this value in source control, chat, screenshots, browser code, or a pu
 
 ## 7. Phase 3 - Configure OME
 
-**Location: Origin SSH terminal. Working directory: `~/ome`**
+**Where to do this:** Run every command in this section on the **origin VM**, not on the Windows workstation, Bunny dashboard, or Cloudflare dashboard. Connect to the VM as `deploy`, then change into the OME project directory:
 
-1. Create the OME server configuration:
+```bash
+ssh deploy@origin01.cockxing.online
+cd ~/ome
+pwd
+```
+
+The last command must print `/home/deploy/ome`. This section creates `~/ome/config/Server.xml`, which is the configuration file Docker mounts into the OME container in Phase 4. Do not create or edit this file under `/etc`, inside a running container, or on the local Windows computer.
+
+1. Confirm the SRT passphrase file created in Phase 2 exists and is readable by `deploy`:
+
+```bash
+test -s ~/ome/config/srt-passphrase.txt && echo "SRT passphrase file is ready"
+```
+
+If the success message does not appear, stop and complete Phase 2 before continuing.
+
+2. Display the passphrase in the SSH terminal. You will paste this value once into `Server.xml`; do not include the placeholder text in the final file and do not put the secret in the guide, screenshots, or source control.
+
+```bash
+cat ~/ome/config/srt-passphrase.txt
+```
+
+3. Create the OME server configuration on the **origin VM**:
 
 ```bash
 nano ~/ome/config/Server.xml
 ```
 
-2. Run `cat ~/ome/config/srt-passphrase.txt`, then paste its value in place of `PASTE_THE_SRT_PASSPHRASE` below. Paste the following configuration, then save (`Ctrl+O`, `Enter`) and exit (`Ctrl+X`).
+4. Paste the configuration below into Nano. Replace only `PASTE_THE_SRT_PASSPHRASE` with the exact value displayed in step 2. Keep the XML tags, indentation, port numbers, and application names unchanged. Then save with `Ctrl+O`, press `Enter` to confirm the filename, and exit with `Ctrl+X`.
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -339,13 +361,16 @@ nano ~/ome/config/Server.xml
 </Server>
 ```
 
-3. Confirm the required sections are present:
+5. Confirm that the file was saved at the expected location and that its required sections are present:
 
 ```bash
+ls -l ~/ome/config/Server.xml
 grep -nE 'Server version|<SRT>|<LLHLS>|<Name>app' ~/ome/config/Server.xml
 ```
 
-`ChunkDuration` and the player live buffer are the main LL-HLS latency controls. Do not attempt to reduce latency by making segments arbitrarily short.
+The `grep` output must include the OME server declaration, an SRT provider, an LL-HLS publisher, and the `app` application. Do not start OME yet: Phase 4 creates the Docker Compose and Caddy configuration, then starts both containers.
+
+This configuration accepts vMix's encrypted SRT contribution on UDP port `9999` and publishes LL-HLS internally on port `3333`. `ChunkDuration` and the player live buffer are the main LL-HLS latency controls. Do not attempt to reduce latency by making segments arbitrarily short.
 
 ## 8. Phase 4 - Configure Caddy and start the containers
 
@@ -903,24 +928,40 @@ The current OME configuration is a single 720p bypass output, so it exposes only
 
 Signed URLs are the access control. CORS only permits browser JavaScript to read cross-origin media responses; it does not stop someone from copying an otherwise public URL.
 
+**Where each part is implemented:**
+
+| Task | Location | Do not do it here |
+|---|---|---|
+| Enable Bunny token authentication and optional referrer rules | Bunny dashboard in a workstation web browser | The origin VM or the player HTML |
+| Store the Bunny token key and sign playback URLs | Your server-side authorizing backend that authenticates viewers | Browser JavaScript, `index.html`, or a CMS field visible to editors |
+| Add CORS origins and restart OME | Origin VM SSH terminal, as `deploy`, in `~/ome` | Bunny dashboard or the visitor's browser |
+| Test a partner embed | The actual HTTPS partner website in a normal browser | A file opened directly from disk or an unrelated test domain |
+
+Complete sections 11.1 through 11.3 before enabling optional hotlink protection in section 11.4.
+
 ### 11.1 Enable viewer authentication
 
-**Location: Bunny dashboard**
+**Where to do this: Bunny dashboard, in a web browser on the administrator workstation. Do not SSH to the origin VM for these steps.**
 
-1. Open **CDN -> Pull Zones -> `player01` -> Security**.
-2. Enable **Advanced Token Authentication** and copy the URL Token Authentication Key.
-3. Put that key only in the authorizing backend's secret manager or server-side environment variables.
-4. Never put the key in HTML, browser JavaScript, an editor-visible CMS setting, or a partner site.
-5. Keep the existing query-string policy; the signer controls the playback URL parameters.
+1. Sign in to Bunny and select **CDN -> Pull Zones -> `player01` -> Security**.
+2. Find **Advanced Token Authentication**, enable it, and save the Pull Zone settings.
+3. Copy the **URL Token Authentication Key**. Treat it as a password: it can create valid viewing URLs for this Pull Zone.
+4. Immediately store it in the secret manager or protected server-side environment of the authorizing backend. Use a clearly named secret such as `BUNNY_PLAYER01_TOKEN_KEY`; the exact name is your backend's choice.
+5. Never put the key in `~/ome/player/index.html`, frontend JavaScript, a public Git repository, an editor-visible CMS setting, a partner site, screenshots, or application logs.
+6. Keep Bunny's existing query-string policy. The server-side signer adds the token parameters to each playback URL.
+7. Leave the dashboard tab open only long enough to confirm the setting is saved. From this point, use the key only through the backend's secret store; do not repeatedly copy it into terminals or chat.
 
 ### 11.2 Issue a short-lived directory token
 
-**Location: Backend/service that authenticates the viewer, never the visitor's browser**
+**Where to do this: the server-side backend or service that already authenticates a viewer. This may be a separate web application, API, or membership system; it is not the Bunny dashboard, `~/ome/player/index.html`, or browser code.**
+
+Before continuing, identify the backend endpoint that authorizes a viewing session. It needs access to the secret saved in section 11.1 and must run over HTTPS. If there is no server-side authorizing backend, stop here: token authentication cannot be safely implemented in a static player page alone.
 
 For each viewing session:
 
-1. Authenticate the viewer and confirm their entitlement before issuing a URL.
-2. Use Bunny's Advanced Token Authentication signer with these inputs:
+1. On the backend, read the Bunny key from its server-side secret store. Do not send the key to the browser.
+2. Authenticate the viewer and confirm their entitlement before issuing a URL—for example, validate their login and that their subscription or event permission is active.
+3. Use Bunny's Advanced Token Authentication signer in the backend with these inputs:
 
 | Signer input | Value |
 |---|---|
@@ -930,22 +971,34 @@ For each viewing session:
 | Expiry | 5-15 minutes, matching the viewing-session design |
 | Signing key | Server-side Bunny URL Token Authentication Key |
 
-3. Return the signed playback URL only to the authorized viewer. Its path begins with `bcdn_token=...`; this allows relative `.m4s` requests to inherit the token.
-4. Log the entitlement decision and expiry, but never log the complete signed URL or the signing key.
-5. Do not enable IP locking by default. It can interrupt viewers roaming between mobile/VPN networks. If it is needed, sign with the viewer's IPv4 and test thoroughly.
+4. Return the resulting signed playback URL only to the authorized viewer, over HTTPS. Configure the player page to use that returned value in place of its default `playbackUrl`.
+5. The signed URL contains `bcdn_token=...`. Keep the token on the `/app/linear/` directory scope so that the playlist's relative `.m4s` segment requests inherit it.
+6. Log the entitlement decision, viewer/account identifier, and expiry time, but never log the complete signed URL, token value, or signing key.
+7. Test three cases from the real player page: a newly issued URL plays; a URL after its expiry fails with `403`; and a URL with a changed token fails with `403`.
+8. Do not enable IP locking by default. It can interrupt viewers roaming between mobile/VPN networks. If it is needed, sign with the viewer's IPv4 and test thoroughly.
 
 ### 11.3 Allow the exact website origins with CORS
 
-**Location: Origin SSH terminal. Working directory: `~/ome`**
+**Where to do this: Origin VM SSH terminal. Connect as `deploy`; run all commands below in `~/ome`. Do not make this edit in the Bunny dashboard, the partner website, or the player HTML.**
 
-1. Identify each exact embedding page origin, including scheme and hostname: for example `https://www.partner.example`.
-2. Edit OME's configuration:
+1. On the partner site, identify each exact page origin, including its scheme and hostname. For example, an embed at `https://www.partner.example/event` has the origin `https://www.partner.example`. It is different from `https://partner.example` and `http://www.partner.example`.
+2. From the administrator workstation, connect to the origin VM and enter the OME directory:
+
+```bash
+ssh deploy@origin01.cockxing.online
+cd ~/ome
+pwd
+```
+
+The final command must print `/home/deploy/ome`.
+
+3. Edit the configuration file mounted into the OME container:
 
 ```bash
 nano ~/ome/config/Server.xml
 ```
 
-3. Under `<CrossDomains>`, retain `player01.cockxing.online` if it hosts a player page and add one `<Url>` per permitted embed origin:
+4. Under `<CrossDomains>`, retain `player01.cockxing.online` if it hosts a player page and add one `<Url>` per permitted embed origin:
 
 ```xml
 <CrossDomains>
@@ -954,7 +1007,13 @@ nano ~/ome/config/Server.xml
 </CrossDomains>
 ```
 
-4. Restart only OME and inspect the log:
+5. Save with `Ctrl+O`, press `Enter`, then exit Nano with `Ctrl+X`. Confirm the entries before restarting OME:
+
+```bash
+grep -n -A 5 -B 1 '<CrossDomains>' ~/ome/config/Server.xml
+```
+
+6. Restart only OME and inspect the log, still on the origin VM:
 
 ```bash
 cd ~/ome
@@ -962,16 +1021,125 @@ sudo docker compose restart ome
 sudo docker compose logs --tail=100 ome
 ```
 
-5. Test from the actual partner page. A browser CORS error means the page's actual origin is not listed. A `403` points to the signed token, its expiry, or an optional hotlink policy.
+7. Test from the actual partner page in a browser. A browser CORS error means the page's actual origin is not listed. A `403` points to the signed token, its expiry, or an optional hotlink policy.
 
 ### 11.4 Optional hotlink protection
 
-**Location: Bunny dashboard**
+**Where to do this: Bunny dashboard in a web browser on the administrator workstation. Do not add referrer values to `Server.xml` or the player HTML.**
 
-1. Under Pull Zone **Security**, add allowed referrers without a scheme, for example `partner.example` and `www.partner.example`.
-2. Include every legitimate embed domain. `*.partner.example` does not include `partner.example`, so add both if required.
-3. Enable **Block Direct URL File Access** only after testing mobile apps, privacy browsers, email links, and casting. These can legitimately omit `Referer`.
-4. Keep signed tokens enabled: referrers may be missing or spoofed.
+1. In **CDN -> Pull Zones -> `player01` -> Security**, find the hotlink/referrer protection settings.
+2. Add allowed referrers without a scheme, for example `partner.example` and `www.partner.example`, then save.
+3. Include every legitimate embed domain. `*.partner.example` does not include `partner.example`, so add both if required.
+4. Test the partner embed first. Then, and only then, enable **Block Direct URL File Access**.
+5. Re-test mobile apps, privacy browsers, email links, and casting, because they can legitimately omit `Referer`.
+6. Keep signed tokens enabled: referrers may be missing or spoofed and are only an additional restriction.
+
+### 11.5 Recommended multi-website implementation - central player with partner embed sessions
+
+Use this design when different partner websites need to embed the same stream. Each partner embeds the player hosted at `player01.cockxing.online`; the partner never receives the Bunny URL Token Authentication Key. A server-side authorizing backend validates each viewing session and returns a short-lived Bunny playback URL to the central player.
+
+```text
+Partner website -> iframe at player01.cockxing.online/player/
+                -> authorizing backend validates embed session
+                -> backend signs /app/linear/ with Bunny key
+                -> player requests the short-lived signed LL-HLS URL
+```
+
+This separates partner access from Bunny access: disable a single partner in the authorizing backend without rotating Bunny's shared signing key or disrupting other partners.
+
+#### 11.5.1 Decide the locations and responsibilities
+
+| Component | Where it runs | Responsibility |
+|---|---|---|
+| Bunny Pull Zone | Bunny dashboard | Enforces valid Bunny tokens for the live playlist and media segments. |
+| Central player | `https://player01.cockxing.online/player/` | Displays the stream and asks the authorizing backend for a playback URL. Its HTML may be public. |
+| Authorizing backend | A server-side HTTPS application you control, for example `https://auth.cockxing.online` | Stores the Bunny key, validates partner/viewer sessions, and signs playback URLs. |
+| Partner server | Each partner's own server | Authenticates its visitor and requests an embed session from the authorizing backend. |
+| Partner web page | The partner's HTTPS website | Contains only an iframe and an opaque, short-lived embed-session value; it never contains the Bunny signing key. |
+
+The guide does not create an authorizing backend because its language, login system, and partner-account model are specific to your application. Do not substitute browser JavaScript or `~/ome/player/index.html` for this backend: either would expose the Bunny signing key.
+
+#### 11.5.2 Protect the stream but leave the static player page reachable
+
+**Where to do this: Bunny dashboard, in the `player01` Pull Zone.**
+
+1. Complete section 11.1 to enable **Advanced Token Authentication** for the Pull Zone and store its key in the authorizing backend's secret manager.
+2. In **CDN -> Pull Zones -> `player01` -> Edge Rules**, add an Edge Rule that matches only `/player/*` and uses **Disable Token Authentication**. Save and enable it.
+3. Do **not** create a matching disable rule for `/app/*`, `/app/linear/*`, `*.m3u8`, or `*.m4s`. Those paths must require a valid Bunny token.
+4. Place the `/player/*` exception ahead of any broader conflicting rule. It makes the player interface public, but not the video stream.
+5. From an external browser, test these two URLs:
+
+```text
+https://player01.cockxing.online/player/
+https://player01.cockxing.online/app/linear/llhls.m3u8
+```
+
+The player page should return `200`; the playlist request without a Bunny token must return `403`. If the playlist returns `200`, stop and correct the Bunny token-authentication or Edge Rule configuration before onboarding partners.
+
+#### 11.5.3 Register each partner in the authorizing backend
+
+**Where to do this: Your server-side authorizing backend's administration interface, database, or deployment configuration. Do not store these records in Bunny or in the player HTML.**
+
+For each partner, create a record with at least:
+
+| Field | Example | Purpose |
+|---|---|---|
+| Partner ID | `partner-acme` | Stable identifier included in audit logs and session claims. |
+| Status | `enabled` | Lets you revoke one partner immediately. |
+| Allowed embed origins | `https://www.acme.example` | Exact domains permitted to request an embed session. |
+| Partner server credential | Unique API key, OAuth client, or mTLS identity | Lets the partner's server authenticate to your backend. Never expose it in browser code. |
+| Stream/event entitlement | `main-live` | Limits the partner to streams/events it has purchased or is allowed to show. |
+
+Require the partner's **server**, not its browser page, to authenticate when creating an embed session. If a partner cannot run a server, provide a tightly scoped, short-lived signed iframe URL from your own portal instead; do not give that partner the Bunny key.
+
+#### 11.5.4 Create and use an embed session
+
+**Where to implement:** The partner server calls the authorizing backend over HTTPS. The resulting iframe tag is rendered by the partner web page.
+
+1. The partner server authenticates its viewer according to the partner's own login or ticketing system.
+2. The partner server sends a server-to-server request to the authorizing backend. Include the partner credential, partner ID, permitted embed origin, viewer/session identifier, and requested stream/event.
+3. The authorizing backend verifies all of the following before responding: the partner is enabled; the submitted origin belongs to that partner; the requested event is entitled; and the session is not expired or revoked.
+4. The backend returns an opaque `embed_session` value with a short expiry, such as five minutes. It should be a signed, tamper-evident token or a random server-side session ID. Include a unique ID (`jti`) so it can be revoked and audited.
+5. The partner renders only an iframe, for example:
+
+```html
+<iframe
+  src="https://player01.cockxing.online/player/?embed_session=REDACTED_SHORT_LIVED_VALUE"
+  title="Live stream"
+  allow="autoplay; fullscreen"
+  allowfullscreen>
+</iframe>
+```
+
+Never put a Bunny `bcdn_token`, the Bunny signing key, or the partner server credential in this iframe markup.
+
+#### 11.5.5 Return a Bunny playback URL to the player
+
+**Where to implement:** In the authorizing backend, plus a small change to `~/ome/player/index.html` on the origin VM. The Bunny key remains in the backend's secret manager only.
+
+1. When the central player loads, it sends its `embed_session` to a dedicated HTTPS backend endpoint, for example `POST https://auth.cockxing.online/v1/playback-url`.
+2. The backend re-validates the session, partner status, requested stream, expiry, and revocation state. It then signs this base URL using the Bunny key:
+
+```text
+https://player01.cockxing.online/app/linear/llhls.m3u8
+```
+
+3. Create a **path-based directory token** with `token_path=/app/linear/` and a 5-15 minute expiry. The backend returns JSON containing the signed playback URL and its expiry time. Do not return the signing key.
+4. In `~/ome/player/index.html`, replace the fixed `const playbackUrl = '/app/linear/llhls.m3u8';` behaviour with a request to that backend endpoint. Use the returned signed URL as `playbackUrl` before calling `startStream()`.
+5. Have the player request a replacement URL before expiry. If renewal fails, stop playback at expiry and display an authorization-expired message instead of retrying the unsigned URL.
+6. Configure the authorizing backend to allow cross-origin requests only from `https://player01.cockxing.online`. The player iframe, not the partner parent page, calls this API.
+
+The signed playback URL is visible to an authorized viewer's browser for its short lifetime. That is expected; it is why the token must be short-lived and scoped only to `/app/linear/`. A viewer can still screen-record a stream, so use contractual controls, watermarking, or DRM if that risk must be addressed.
+
+#### 11.5.6 CORS, hotlink rules, and tests for partner rollout
+
+**Locations:** Make CORS changes on the **origin VM SSH terminal**; make hotlink changes in the **Bunny dashboard**; perform tests from each **actual partner website**.
+
+1. With the iframe model, retain `https://player01.cockxing.online` in OME `<CrossDomains>`. The iframe document makes the media requests, so normally the partner parent domains do not need to be added there.
+2. If a partner instead hosts its own player JavaScript and calls the HLS URL directly, add that partner's exact HTTPS origin under `<CrossDomains>` as described in section 11.3. Its server must still obtain a short-lived playback URL from your authorizing backend.
+3. Add hotlink allowed-referrer domains only as a secondary restriction, and test carefully. An iframe's media requests can use the player URL or omit `Referer`, depending on browser privacy settings and referrer policy.
+4. For every new partner, test: an entitled viewer plays; an expired embed session cannot obtain a URL; an expired Bunny URL returns `403`; a disabled partner cannot obtain a URL; and an unrelated website cannot create a partner session.
+5. Log partner ID, viewer/session ID, event, issue time, and expiry. Never log full embed sessions, Bunny tokens, or the Bunny signing key.
 
 ## 12. Optional policy - Block a country
 
