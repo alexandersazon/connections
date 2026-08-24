@@ -606,9 +606,11 @@ Paste the following. It uses the same-host HLS path by default. If Bunny token a
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Cockxing Player</title>
   <style>
+    html, body { background: #000; margin: 0; min-height: 100%; padding: 0; }
+    body { min-height: 100vh; }
     .player {
-      background: transparent; color: #fff; font-family: Arial, sans-serif;
-      max-width: 960px; position: relative;
+      background: #000; color: #fff; font-family: Arial, sans-serif;
+      margin: 0; max-width: 960px; padding: 0; position: relative;
     }
     .video-frame { aspect-ratio: 16 / 9; position: relative; }
     video { aspect-ratio: 16 / 9; display: block; object-fit: contain; width: 100%; }
