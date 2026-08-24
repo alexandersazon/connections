@@ -218,6 +218,7 @@ sudo apt update
 sudo apt install -y docker.io docker-compose-v2 curl openssl ufw
 sudo systemctl enable --now docker
 sudo install -d -m 750 -o deploy -g deploy "$HOME/ome/config" "$HOME/ome/caddy"
+sudo install -d -m 755 -o deploy -g deploy "$HOME/ome/player"
 docker compose version
 ```
 
@@ -263,7 +264,7 @@ chmod 600 "$HOME/ome/config/srt-passphrase.txt"
 
 Never put this value in source control, chat, screenshots, browser code, or a public ticket.
 
-**Phase 2 gate:** `~/ome/config`, `~/ome/caddy`, and the two mode-`600` secret files exist under the `deploy` account.
+**Phase 2 gate:** `~/ome/config`, `~/ome/caddy`, `~/ome/player`, and the two mode-`600` secret files exist under the `deploy` account. The `player` directory is used only by the optional player UI in section 10.5.
 
 ## 7. Phase 3 - Configure OME
 
@@ -370,15 +371,21 @@ nano ~/ome/caddy/Caddyfile
 origin01.cockxing.online {
     @bunny header X-Origin-Verify "PASTE_THE_SECRET_FROM_THE_FILE"
     handle @bunny {
-        reverse_proxy ome:3333 {
-            header_up -X-Origin-Verify
+        handle_path /player/* {
+            root * /srv/player
+            file_server
+        }
+        handle {
+            reverse_proxy ome:3333 {
+                header_up -X-Origin-Verify
+            }
         }
     }
     respond "Not found" 404
 }
 ```
 
-Any request that omits or mismatches the header gets `404`; OME is not directly exposed. Caddy removes the verification header before proxying so the secret is not written into OME request logs.
+Any request that omits or mismatches the header gets `404`; OME and the optional `/player/` static page are not directly exposed. Caddy removes the verification header before proxying so the secret is not written into OME request logs. The `/player/` route strips that prefix and serves files mounted at `/srv/player`; every other authorized request continues to OME.
 
 ### 8.2 Create and launch Docker Compose
 
@@ -409,6 +416,7 @@ services:
       - "443:443"
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./player:/srv/player:ro
       - caddy_data:/data
       - caddy_config:/config
     networks: [streaming]
@@ -575,6 +583,235 @@ https://player01.cockxing.online/app/linear/llhls.m3u8
 
 Video and audio should begin. Browser/player requests for both the playlist and `.m4s` files must go to `player01.cockxing.online`, never `origin01.cockxing.online`.
 
+### 10.5 Optional - Create an editable player UI
+
+**Location: Origin SSH terminal. Working directory: `~/ome`**
+
+`player01.cockxing.online` is Bunny's custom hostname, not a separate web host. The Caddy and Compose configuration in Phase 4 therefore gives Bunny an authorized `/player/` origin path for this static page. The Compose bind mount maps the origin VM folder `~/ome/player` to `/srv/player` **inside the Caddy container**, read-only. Viewers load it through Bunny at `https://player01.cockxing.online/player/`; they must never use `https://origin01.cockxing.online/player/`.
+
+The example uses a small custom control bar, so each UI element can be enabled or removed without relying on browser-specific native controls. Create the directory and file:
+
+```bash
+sudo install -d -m 755 -o deploy -g deploy "$HOME/ome/player"
+nano ~/ome/player/index.html
+```
+
+Paste the following. It uses the same-host HLS path by default. If Bunny token authentication is enabled, have the authorizing backend supply a newly issued signed playback URL in place of `playbackUrl`; do not place a permanent signed URL or token key in this file.
+
+```html
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live player</title>
+  <style>
+    .player { background: #000; color: #fff; max-width: 960px; position: relative; }
+    .video-frame { aspect-ratio: 16 / 9; position: relative; }
+    video { aspect-ratio: 16 / 9; display: block; object-fit: contain; width: 100%; }
+    .controls { align-items: center; display: flex; gap: .75rem; padding: .75rem; }
+    .controls button, .controls select { font: inherit; }
+    [hidden] { display: none !important; }
+    #liveStatus { color: #ff4d4f; font-weight: 700; }
+    #streamStatus {
+      align-items: center; background: #000; display: flex; font-weight: 700;
+      inset: 0; justify-content: center; letter-spacing: .04em; position: absolute;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="player" id="player">
+    <div class="video-frame">
+      <video id="video" muted autoplay playsinline aria-label="Live stream"></video>
+      <div id="streamStatus" role="status" aria-live="polite">WAIT FOR THE LIVE STREAM</div>
+    </div>
+    <div class="controls" aria-label="Player controls">
+      <button id="playButton" type="button" aria-label="Play live stream">Play</button>
+      <span id="liveStatus" aria-live="polite">LIVE</span>
+      <span id="time" aria-live="off">--:--</span>
+      <label id="resolutionControl">
+        Resolution
+        <select id="resolution" aria-label="Resolution"><option value="-1">Auto</option></select>
+      </label>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.1"></script>
+  <script>
+    const settings = {
+      showPlayButton: false,       // Set true to show the Play/Pause button.
+      showTime: false,             // Set true to show the live-edge time display.
+      showResolutionMenu: true     // It is hidden automatically for a single rendition.
+    };
+    const playbackUrl = '/app/linear/llhls.m3u8';
+    const video = document.querySelector('#video');
+    const playButton = document.querySelector('#playButton');
+    const time = document.querySelector('#time');
+    const liveStatus = document.querySelector('#liveStatus');
+    const streamStatus = document.querySelector('#streamStatus');
+    const resolutionControl = document.querySelector('#resolutionControl');
+    const resolution = document.querySelector('#resolution');
+    const retryDelayMs = 10000;
+    let hls;
+    let retryTimer;
+    let usingNativeHls = false;
+
+    playButton.hidden = !settings.showPlayButton;
+    time.hidden = !settings.showTime;
+    resolutionControl.hidden = !settings.showResolutionMenu;
+
+    function syncPlayButton() {
+      playButton.textContent = video.paused ? 'Play' : 'Pause';
+      playButton.setAttribute('aria-label', playButton.textContent + ' live stream');
+    }
+
+    function updateTime() {
+      // A live HLS stream has no fixed duration; show distance from its live edge.
+      const range = video.seekable;
+      if (!range.length) return;
+      const behindLive = Math.max(0, range.end(range.length - 1) - video.currentTime);
+      time.textContent = behindLive < 1 ? 'LIVE' : '-' + Math.round(behindLive) + 's';
+    }
+
+    function togglePlayback() {
+      if (video.paused) video.play().catch(function () {}); else video.pause();
+    }
+
+    function showWaiting() {
+      streamStatus.textContent = 'WAIT FOR THE LIVE STREAM';
+      streamStatus.hidden = false;
+      liveStatus.hidden = true;
+      resolutionControl.hidden = true;
+    }
+
+    function showLive() {
+      streamStatus.hidden = true;
+      liveStatus.hidden = false;
+    }
+
+    function startMutedPlayback() {
+      // Browsers allow automatic live playback only when it starts muted.
+      video.play().catch(function () {});
+    }
+
+    function resetResolutionMenu() {
+      resolution.innerHTML = '<option value="-1">Auto</option>';
+    }
+
+    function stopHls() {
+      if (hls) {
+        hls.destroy();
+        hls = undefined;
+      }
+    }
+
+    function scheduleRetry() {
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(startStream, retryDelayMs);
+    }
+
+    function handleStreamOffline() {
+      stopHls();
+      usingNativeHls = false;
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+      showWaiting();
+      scheduleRetry();
+    }
+
+    function addResolutionLevels(levels) {
+      resetResolutionMenu();
+      resolutionControl.hidden = !settings.showResolutionMenu || levels.length < 2;
+      levels.forEach(function (level, index) {
+        const option = document.createElement('option');
+        option.value = index;
+        option.textContent = level.height ? level.height + 'p' : Math.round(level.bitrate / 1000) + ' kbps';
+        resolution.appendChild(option);
+      });
+    }
+
+    function startHlsJsPlayback() {
+      const instance = new Hls();
+      hls = instance;
+      instance.on(Hls.Events.MANIFEST_PARSED, function () {
+        if (hls !== instance) return;
+        addResolutionLevels(instance.levels);
+        showLive();
+        startMutedPlayback();
+      });
+      instance.on(Hls.Events.ERROR, function (_event, data) {
+        if (hls === instance && data.fatal) handleStreamOffline();
+      });
+      instance.loadSource(playbackUrl);
+      instance.attachMedia(video);
+    }
+
+    function startStream() {
+      clearTimeout(retryTimer);
+      stopHls();
+      resetResolutionMenu();
+      showWaiting();
+      if (window.Hls && Hls.isSupported()) {
+        usingNativeHls = false;
+        startHlsJsPlayback();
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        usingNativeHls = true;
+        video.src = playbackUrl;
+        video.load();
+      } else {
+        streamStatus.textContent = 'HLS playback is not supported by this browser.';
+      }
+    }
+
+    playButton.addEventListener('click', togglePlayback);
+    video.addEventListener('click', function () {
+      // The first viewer click enables sound; later clicks toggle play/pause.
+      if (video.muted) {
+        video.muted = false;
+        video.play().catch(function () {});
+      } else {
+        togglePlayback();
+      }
+    });
+    video.addEventListener('play', syncPlayButton);
+    video.addEventListener('pause', syncPlayButton);
+    video.addEventListener('timeupdate', updateTime);
+    video.addEventListener('progress', updateTime);
+    video.addEventListener('loadedmetadata', function () {
+      if (!usingNativeHls) return;
+      showLive();
+      startMutedPlayback();
+    });
+    video.addEventListener('error', function () {
+      if (usingNativeHls) handleStreamOffline();
+    });
+    resolution.addEventListener('change', function () {
+      if (hls) hls.currentLevel = Number(resolution.value); // -1 restores adaptive Auto quality.
+    });
+
+    startStream();
+  </script>
+</body>
+</html>
+```
+
+Apply the Caddy and Compose changes from Phase 4, then start or recreate Caddy so it receives the static-file mount:
+
+```bash
+cd ~/ome
+sudo docker compose config --quiet
+sudo docker compose up -d
+sudo docker compose logs --tail=50 caddy
+```
+
+Set `showPlayButton` or `showTime` to `false` to remove those controls; the video itself remains clickable for play/pause when the button is hidden. The time display is deliberately a live-edge offset rather than a duration because a live stream has no fixed end time.
+
+When no live manifest is available, a full-frame `WAIT FOR THE LIVE STREAM` message is displayed and the player retries every 10 seconds. As soon as OME publishes the manifest, the overlay is removed and playback starts automatically. Browsers permit that automatic start only when muted; the first viewer click on the video enables audio, and later clicks toggle play/pause.
+
+The current OME configuration is a single 720p bypass output, so it exposes only one HLS rendition. The resolution menu therefore remains hidden with this guide's default stream. A UI cannot create 480p/720p/1080p choices: configure a multi-variant HLS playlist from multiple encoder outputs or a transcoding workflow first. When that playlist has two or more variants, hls.js populates the menu and `Auto` retains adaptive-bitrate selection; a forced resolution can cause a short rebuffer while the player switches levels.
+
 ## 11. Phase 7 - Secure a stream embedded on another website
 
 Signed URLs are the access control. CORS only permits browser JavaScript to read cross-origin media responses; it does not stop someone from copying an otherwise public URL.
@@ -723,6 +960,8 @@ Before a live event, rehearse encoder restart, VM restart, certificate renewal, 
 - [OME configuration](https://ovenmedia.com/docs/ome/configuration)
 - [OME SRT ingest](https://ovenmedia.com/docs/ome/live-source/srt)
 - [OME LL-HLS](https://docs.ovenmediaengine.com/0.17.2/streaming/low-latency-hls)
+- [hls.js embedding and browser-support guidance](https://www.npmjs.com/package/hls.js)
+- [hls.js quality-switch API](https://github.com/video-dev/hls.js/blob/master/docs/API.md)
 - [Bunny CDN pricing](https://docs.bunny.net/cdn/pricing)
 - [Bunny advanced token authentication](https://docs.bunny.net/cdn/security/token-authentication/advanced)
 - [Bunny hotlink protection](https://docs.bunny.net/cdn/security/hotlink-protection)
