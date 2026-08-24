@@ -604,12 +604,11 @@ Paste the following. It uses the same-host HLS path by default. If Bunny token a
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Live player</title>
+  <title>Cockxing Player</title>
   <style>
-    html, body { background: #000; margin: 0; padding: 0; }
     .player {
-      background: transparent; border: 0; color: #fff; font-family: Arial, sans-serif;
-      margin: 0; max-width: 960px; padding: 0; position: relative;
+      background: transparent; color: #fff; font-family: Arial, sans-serif;
+      max-width: 960px; position: relative;
     }
     .video-frame { aspect-ratio: 16 / 9; position: relative; }
     video { aspect-ratio: 16 / 9; display: block; object-fit: contain; width: 100%; }
@@ -644,7 +643,7 @@ Paste the following. It uses the same-host HLS path by default. If Bunny token a
   <div class="player" id="player">
     <div class="video-frame">
       <video id="video" muted autoplay playsinline aria-label="Live stream"></video>
-      <div id="streamStatus" role="status" aria-live="polite">WAIT FOR THE LIVE STREAM</div>
+      <div id="streamStatus" role="status" aria-live="polite">WAIT FOR THE LIVE STREAM...</div>
     </div>
     <div class="controls" aria-label="Player controls">
       <button id="playButton" type="button" aria-label="Play live stream">Play</button>
