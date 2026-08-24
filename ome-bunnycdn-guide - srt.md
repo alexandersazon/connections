@@ -924,7 +924,236 @@ When no live manifest is available, a full-frame `WAIT FOR THE LIVE STREAM` mess
 
 The current OME configuration is a single 720p bypass output, so it exposes only one HLS rendition. The resolution menu therefore remains hidden with this guide's default stream. A UI cannot create 480p/720p/1080p choices: configure a multi-variant HLS playlist from multiple encoder outputs or a transcoding workflow first. When that playlist has two or more variants, hls.js populates the menu and `Auto` retains adaptive-bitrate selection; a forced resolution can cause a short rebuffer while the player switches levels.
 
-## 11. Phase 7 - Secure a stream embedded on another website
+## 11. Optional - Add a concurrent-viewer count
+
+This section adds a **current active-player-session** count. It is not Bunny's total-view metric and must not be used for billing, prizes, or attendance: a browser can be duplicated or automated. Use Bunny Pull Zone analytics for delivery, traffic, and historical reporting. This counter is useful for displaying a near-real-time "watching now" number beside the player.
+
+Use **JavaScript on Node.js 22**. It fits the existing browser JavaScript player, runs in a small container, needs no external package manager, and remains on the private Docker network. The files are all kept under `~/ome/viewer-count` on the origin:
+
+| File | Purpose |
+|---|---|
+| `~/ome/viewer-count/server.js` | The Node HTTP service that accepts heartbeats and returns the active count. |
+| `~/ome/viewer-count/Dockerfile` | Builds the small service container. |
+| `~/ome/docker-compose.yml` | Starts the service without publishing a host port. |
+| `~/ome/caddy/Caddyfile` | Sends Bunny-authorized `/viewer-api/` requests to the service. |
+| `~/ome/player/index.html` | Sends the player heartbeat and optionally displays the count. |
+
+Each browser tab creates a random ID in `sessionStorage`. Once playback reaches a live manifest it sends a heartbeat every 30 seconds. The service considers that ID active for 90 seconds, so a closed tab disappears automatically without a logout request.
+
+### 11.1 Create the service files
+
+**Location: Origin SSH terminal. Working directory: `~/ome`**
+
+Create the directory and service file:
+
+```bash
+sudo install -d -m 755 -o deploy -g deploy "$HOME/ome/viewer-count"
+nano ~/ome/viewer-count/server.js
+```
+
+Paste the following. It deliberately uses only Node's built-in `http` module, so there is no `package.json`, `npm install`, or third-party dependency to maintain.
+
+```js
+const http = require('node:http');
+
+const port = 3000;
+const heartbeatIntervalMs = 30_000;
+const viewerTtlMs = 90_000;
+const maxBodyBytes = 2_048;
+const viewers = new Map();
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function pruneViewers() {
+  const cutoff = Date.now() - viewerTtlMs;
+  for (const [viewerId, lastSeen] of viewers) {
+    if (lastSeen < cutoff) viewers.delete(viewerId);
+  }
+}
+
+function sendJson(response, status, body) {
+  response.writeHead(status, {
+    'Cache-Control': 'no-store',
+    'Content-Type': 'application/json; charset=utf-8'
+  });
+  response.end(JSON.stringify(body));
+}
+
+const server = http.createServer((request, response) => {
+  const url = new URL(request.url, 'http://viewer-count');
+
+  if (request.method === 'GET' && url.pathname === '/healthz') {
+    return sendJson(response, 200, { ok: true });
+  }
+
+  if (request.method === 'GET' && url.pathname === '/count') {
+    pruneViewers();
+    return sendJson(response, 200, {
+      concurrentViewers: viewers.size,
+      heartbeatIntervalSeconds: heartbeatIntervalMs / 1000,
+      activeWindowSeconds: viewerTtlMs / 1000
+    });
+  }
+
+  if (request.method !== 'POST' || url.pathname !== '/heartbeat') {
+    return sendJson(response, 404, { error: 'Not found' });
+  }
+
+  let body = '';
+  request.setEncoding('utf8');
+  request.on('data', (chunk) => {
+    body += chunk;
+    if (Buffer.byteLength(body) > maxBodyBytes) request.destroy();
+  });
+  request.on('end', () => {
+    try {
+      const { viewerId } = JSON.parse(body);
+      if (typeof viewerId !== 'string' || !uuid.test(viewerId)) {
+        return sendJson(response, 400, { error: 'A valid viewerId is required' });
+      }
+      pruneViewers();
+      viewers.set(viewerId, Date.now());
+      return sendJson(response, 204, {});
+    } catch {
+      return sendJson(response, 400, { error: 'Invalid JSON' });
+    }
+  });
+});
+
+setInterval(pruneViewers, heartbeatIntervalMs).unref();
+server.listen(port, '0.0.0.0', () => console.log(`viewer-count listening on ${port}`));
+```
+
+Create the container build file:
+
+```bash
+nano ~/ome/viewer-count/Dockerfile
+```
+
+```dockerfile
+FROM node:22-alpine
+WORKDIR /app
+COPY server.js ./
+USER node
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+### 11.2 Route the service through Caddy and Compose
+
+**Location: Origin SSH terminal. Working directory: `~/ome`**
+
+Edit `~/ome/caddy/Caddyfile`. Inside the existing `handle @bunny` block, add this handler **after** the `/player/` handler and **before** the final catch-all `handle`:
+
+```caddyfile
+        handle_path /viewer-api/* {
+            reverse_proxy viewer-count:3000
+        }
+```
+
+The route remains protected by the existing Bunny `X-Origin-Verify` check. It does not expose port 3000 on the VM.
+
+Edit `~/ome/docker-compose.yml` and add this service at the same level as `ome` and `caddy`:
+
+```yaml
+  viewer-count:
+    build: ./viewer-count
+    restart: unless-stopped
+    networks: [streaming]
+```
+
+In the Bunny Pull Zone, add an Edge Rule for `*/viewer-api/*` that overrides both edge and browser cache time to `0` seconds. The service also sends `Cache-Control: no-store`; the rule makes the no-cache intent explicit at the CDN.
+
+Build, validate, and start the changed services:
+
+```bash
+cd ~/ome
+sudo docker compose config --quiet
+sudo docker compose up -d --build
+sudo docker compose ps
+sudo docker compose logs --tail=50 viewer-count caddy
+```
+
+### 11.3 Add heartbeats and the optional display to the player
+
+**Location: Origin SSH terminal. File: `~/ome/player/index.html`**
+
+Add this element in the `.controls` block, for example after the `LIVE` span:
+
+```html
+      <span id="viewerCount" aria-live="polite">0 watching</span>
+```
+
+Add the following constants immediately after the existing `const retryDelayMs = 10000;` line:
+
+```js
+    const viewerIdKey = 'omeViewerId';
+    const viewerId = sessionStorage.getItem(viewerIdKey) || crypto.randomUUID();
+    const viewerHeartbeatUrl = '/viewer-api/heartbeat';
+    const viewerCountUrl = '/viewer-api/count';
+    const viewerHeartbeatMs = 30_000;
+    const viewerCount = document.querySelector('#viewerCount');
+    let viewerTimer;
+```
+
+Then add these functions before `function startStream()`:
+
+```js
+    function sendViewerHeartbeat() {
+      fetch(viewerHeartbeatUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ viewerId }),
+        keepalive: true
+      }).catch(function () {});
+    }
+
+    function refreshViewerCount() {
+      fetch(viewerCountUrl, { cache: 'no-store' })
+        .then(function (response) { return response.json(); })
+        .then(function (data) {
+          viewerCount.textContent = data.concurrentViewers + ' watching';
+        })
+        .catch(function () {});
+    }
+
+    function startViewerTracking() {
+      if (viewerTimer) return;
+      sessionStorage.setItem(viewerIdKey, viewerId);
+      sendViewerHeartbeat();
+      refreshViewerCount();
+      viewerTimer = setInterval(function () {
+        sendViewerHeartbeat();
+        refreshViewerCount();
+      }, viewerHeartbeatMs);
+    }
+
+    function stopViewerTracking() {
+      clearInterval(viewerTimer);
+      viewerTimer = undefined;
+    }
+```
+
+Add `startViewerTracking();` as the final line in `showLive()`, and add `stopViewerTracking();` as the first line in `handleStreamOffline()`. This starts measurement only after the manifest is available and stops retries when the stream goes offline.
+
+Recreate the services and test from an external device:
+
+```bash
+cd ~/ome
+sudo docker compose up -d --build
+sudo docker compose logs --tail=50 viewer-count
+```
+
+Open `https://player01.cockxing.online/player/` in two separate browser profiles or devices. After both reach `LIVE`, the display should become `2 watching` within 30 seconds. Close one tab and wait up to 90 seconds for it to disappear. For a direct API check, use the Bunny hostname, never the origin hostname:
+
+```bash
+curl https://player01.cockxing.online/viewer-api/count
+```
+
+The in-memory map resets to zero when the `viewer-count` container restarts. That is correct for a concurrent counter. If you later run multiple origin instances, replace the `Map` with a shared Redis store using a 90-second TTL; otherwise each origin reports only its local viewers.
+
+For a private or paid stream, integrate the heartbeat with the same server-side viewer authentication used to issue Bunny directory tokens in section 12. Require a valid authenticated session before accepting `/heartbeat`, and derive the viewer key from the authenticated account/session rather than trusting the browser-provided ID. Do not expose this lightweight counter as an anti-fraud or entitlement system.
+
+## 12. Phase 7 - Secure a stream embedded on another website
 
 Signed URLs are the access control. CORS only permits browser JavaScript to read cross-origin media responses; it does not stop someone from copying an otherwise public URL.
 
@@ -937,9 +1166,9 @@ Signed URLs are the access control. CORS only permits browser JavaScript to read
 | Add CORS origins and restart OME | Origin VM SSH terminal, as `deploy`, in `~/ome` | Bunny dashboard or the visitor's browser |
 | Test a partner embed | The actual HTTPS partner website in a normal browser | A file opened directly from disk or an unrelated test domain |
 
-Complete sections 11.1 through 11.3 before enabling optional hotlink protection in section 11.4.
+Complete sections 12.1 through 12.3 before enabling optional hotlink protection in section 12.4.
 
-### 11.1 Enable viewer authentication
+### 12.1 Enable viewer authentication
 
 **Where to do this: Bunny dashboard, in a web browser on the administrator workstation. Do not SSH to the origin VM for these steps.**
 
@@ -951,11 +1180,11 @@ Complete sections 11.1 through 11.3 before enabling optional hotlink protection 
 6. Keep Bunny's existing query-string policy. The server-side signer adds the token parameters to each playback URL.
 7. Leave the dashboard tab open only long enough to confirm the setting is saved. From this point, use the key only through the backend's secret store; do not repeatedly copy it into terminals or chat.
 
-### 11.2 Issue a short-lived directory token
+### 12.2 Issue a short-lived directory token
 
 **Where to do this: the server-side backend or service that already authenticates a viewer. This may be a separate web application, API, or membership system; it is not the Bunny dashboard, `~/ome/player/index.html`, or browser code.**
 
-Before continuing, identify the backend endpoint that authorizes a viewing session. It needs access to the secret saved in section 11.1 and must run over HTTPS. If there is no server-side authorizing backend, stop here: token authentication cannot be safely implemented in a static player page alone.
+Before continuing, identify the backend endpoint that authorizes a viewing session. It needs access to the secret saved in section 12.1 and must run over HTTPS. If there is no server-side authorizing backend, stop here: token authentication cannot be safely implemented in a static player page alone.
 
 For each viewing session:
 
@@ -977,7 +1206,7 @@ For each viewing session:
 7. Test three cases from the real player page: a newly issued URL plays; a URL after its expiry fails with `403`; and a URL with a changed token fails with `403`.
 8. Do not enable IP locking by default. It can interrupt viewers roaming between mobile/VPN networks. If it is needed, sign with the viewer's IPv4 and test thoroughly.
 
-### 11.3 Allow the exact website origins with CORS
+### 12.3 Allow the exact website origins with CORS
 
 **Where to do this: Origin VM SSH terminal. Connect as `deploy`; run all commands below in `~/ome`. Do not make this edit in the Bunny dashboard, the partner website, or the player HTML.**
 
@@ -1023,7 +1252,7 @@ sudo docker compose logs --tail=100 ome
 
 7. Test from the actual partner page in a browser. A browser CORS error means the page's actual origin is not listed. A `403` points to the signed token, its expiry, or an optional hotlink policy.
 
-### 11.4 Optional hotlink protection
+### 12.4 Optional hotlink protection
 
 **Where to do this: Bunny dashboard in a web browser on the administrator workstation. Do not add referrer values to `Server.xml` or the player HTML.**
 
@@ -1034,7 +1263,7 @@ sudo docker compose logs --tail=100 ome
 5. Re-test mobile apps, privacy browsers, email links, and casting, because they can legitimately omit `Referer`.
 6. Keep signed tokens enabled: referrers may be missing or spoofed and are only an additional restriction.
 
-### 11.5 Recommended multi-website implementation - central player with partner embed sessions
+### 12.5 Recommended multi-website implementation - central player with partner embed sessions
 
 Use this design when different partner websites need to embed the same stream. Each partner embeds the player hosted at `player01.cockxing.online`; the partner never receives the Bunny URL Token Authentication Key. A server-side authorizing backend validates each viewing session and returns a short-lived Bunny playback URL to the central player.
 
@@ -1047,7 +1276,7 @@ Partner website -> iframe at player01.cockxing.online/player/
 
 This separates partner access from Bunny access: disable a single partner in the authorizing backend without rotating Bunny's shared signing key or disrupting other partners.
 
-#### 11.5.1 Decide the locations and responsibilities
+#### 12.5.1 Decide the locations and responsibilities
 
 | Component | Where it runs | Responsibility |
 |---|---|---|
@@ -1059,11 +1288,11 @@ This separates partner access from Bunny access: disable a single partner in the
 
 The guide does not create an authorizing backend because its language, login system, and partner-account model are specific to your application. Do not substitute browser JavaScript or `~/ome/player/index.html` for this backend: either would expose the Bunny signing key.
 
-#### 11.5.2 Protect the stream but leave the static player page reachable
+#### 12.5.2 Protect the stream but leave the static player page reachable
 
 **Where to do this: Bunny dashboard, in the `player01` Pull Zone.**
 
-1. Complete section 11.1 to enable **Advanced Token Authentication** for the Pull Zone and store its key in the authorizing backend's secret manager.
+1. Complete section 12.1 to enable **Advanced Token Authentication** for the Pull Zone and store its key in the authorizing backend's secret manager.
 2. In **CDN -> Pull Zones -> `player01` -> Edge Rules**, add an Edge Rule that matches only `/player/*` and uses **Disable Token Authentication**. Save and enable it.
 3. Do **not** create a matching disable rule for `/app/*`, `/app/linear/*`, `*.m3u8`, or `*.m4s`. Those paths must require a valid Bunny token.
 4. Place the `/player/*` exception ahead of any broader conflicting rule. It makes the player interface public, but not the video stream.
@@ -1076,7 +1305,7 @@ https://player01.cockxing.online/app/linear/llhls.m3u8
 
 The player page should return `200`; the playlist request without a Bunny token must return `403`. If the playlist returns `200`, stop and correct the Bunny token-authentication or Edge Rule configuration before onboarding partners.
 
-#### 11.5.3 Register each partner in the authorizing backend
+#### 12.5.3 Register each partner in the authorizing backend
 
 **Where to do this: Your server-side authorizing backend's administration interface, database, or deployment configuration. Do not store these records in Bunny or in the player HTML.**
 
@@ -1092,7 +1321,7 @@ For each partner, create a record with at least:
 
 Require the partner's **server**, not its browser page, to authenticate when creating an embed session. If a partner cannot run a server, provide a tightly scoped, short-lived signed iframe URL from your own portal instead; do not give that partner the Bunny key.
 
-#### 11.5.4 Create and use an embed session
+#### 12.5.4 Create and use an embed session
 
 **Where to implement:** The partner server calls the authorizing backend over HTTPS. The resulting iframe tag is rendered by the partner web page.
 
@@ -1113,7 +1342,7 @@ Require the partner's **server**, not its browser page, to authenticate when cre
 
 Never put a Bunny `bcdn_token`, the Bunny signing key, or the partner server credential in this iframe markup.
 
-#### 11.5.5 Return a Bunny playback URL to the player
+#### 12.5.5 Return a Bunny playback URL to the player
 
 **Where to implement:** In the authorizing backend, plus a small change to `~/ome/player/index.html` on the origin VM. The Bunny key remains in the backend's secret manager only.
 
@@ -1131,17 +1360,17 @@ https://player01.cockxing.online/app/linear/llhls.m3u8
 
 The signed playback URL is visible to an authorized viewer's browser for its short lifetime. That is expected; it is why the token must be short-lived and scoped only to `/app/linear/`. A viewer can still screen-record a stream, so use contractual controls, watermarking, or DRM if that risk must be addressed.
 
-#### 11.5.6 CORS, hotlink rules, and tests for partner rollout
+#### 12.5.6 CORS, hotlink rules, and tests for partner rollout
 
 **Locations:** Make CORS changes on the **origin VM SSH terminal**; make hotlink changes in the **Bunny dashboard**; perform tests from each **actual partner website**.
 
 1. With the iframe model, retain `https://player01.cockxing.online` in OME `<CrossDomains>`. The iframe document makes the media requests, so normally the partner parent domains do not need to be added there.
-2. If a partner instead hosts its own player JavaScript and calls the HLS URL directly, add that partner's exact HTTPS origin under `<CrossDomains>` as described in section 11.3. Its server must still obtain a short-lived playback URL from your authorizing backend.
+2. If a partner instead hosts its own player JavaScript and calls the HLS URL directly, add that partner's exact HTTPS origin under `<CrossDomains>` as described in section 12.3. Its server must still obtain a short-lived playback URL from your authorizing backend.
 3. Add hotlink allowed-referrer domains only as a secondary restriction, and test carefully. An iframe's media requests can use the player URL or omit `Referer`, depending on browser privacy settings and referrer policy.
 4. For every new partner, test: an entitled viewer plays; an expired embed session cannot obtain a URL; an expired Bunny URL returns `403`; a disabled partner cannot obtain a URL; and an unrelated website cannot create a partner session.
 5. Log partner ID, viewer/session ID, event, issue time, and expiry. Never log full embed sessions, Bunny tokens, or the Bunny signing key.
 
-## 12. Optional policy - Block a country
+## 13. Optional policy - Block a country
 
 Country blocking is enforced by Bunny using the viewer's IP geolocation. It applies to the whole Pull Zone, which blocks both playlists and media fragments.
 
@@ -1155,7 +1384,7 @@ Country blocking is enforced by Bunny using the viewer's IP geolocation. It appl
 
 If country access must vary per viewer, do not use a Pull-Zone-wide block. Instead, have the server-side directory-token signer use `token_countries` or `token_countries_blocked` for that viewer.
 
-## 13. Final acceptance checklist
+## 14. Final acceptance checklist
 
 Complete these checks before calling the stream ready:
 
@@ -1168,10 +1397,11 @@ Complete these checks before calling the stream ready:
 - [ ] Playlist and media requests use `player01`, not the origin hostname.
 - [ ] `.m3u8` is not cached; `.m4s` has the intended TTL.
 - [ ] If protected, a valid short-lived token plays and an expired/missing token fails.
+- [ ] If the optional viewer counter is enabled, two live player sessions show `2 watching` and a closed tab expires within 90 seconds.
 - [ ] If embedded, every actual website origin is in `<CrossDomains>` and partner playback has no CORS error.
 - [ ] Tests from meaningful audience regions record startup time, rebuffer count, and live latency.
 
-## 14. Operations, incidents, and routine checks
+## 15. Operations, incidents, and routine checks
 
 **Location: Origin SSH terminal for commands; Bunny dashboard for CDN metrics**
 
@@ -1182,6 +1412,7 @@ cd ~/ome
 sudo docker compose ps
 sudo docker compose logs --tail=200 ome
 sudo docker compose logs --tail=200 caddy
+sudo docker compose logs --tail=200 viewer-count
 sudo docker stats --no-stream
 ```
 
