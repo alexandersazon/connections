@@ -814,7 +814,7 @@ The current OME configuration is a single 720p bypass output, so it exposes only
 
 ## 11. Optional - Add a concurrent-viewer count
 
-This section adds a **current active-player-session** count. It is not Bunny's total-view metric and must not be used for billing, prizes, or attendance: a browser can be duplicated or automated. Use Bunny Pull Zone analytics for delivery, traffic, and historical reporting. This counter is useful for displaying a near-real-time "watching now" number beside the player.
+This section adds a **current active-player-session** count. It is not Bunny's total-view metric and must not be used for billing, prizes, or attendance: a browser can be duplicated or automated. Use Bunny Pull Zone analytics for delivery, traffic, and historical reporting. The count is shown only on a separate, password-protected operator dashboard; customers using the player never see it.
 
 Use **JavaScript on Node.js 22**. It fits the existing browser JavaScript player, runs in a small container, needs no external package manager, and remains on the private Docker network. The files are all kept under `~/ome/viewer-count` on the origin:
 
@@ -824,9 +824,10 @@ Use **JavaScript on Node.js 22**. It fits the existing browser JavaScript player
 | `~/ome/viewer-count/Dockerfile` | Builds the small service container. |
 | `~/ome/docker-compose.yml` | Starts the service without publishing a host port. |
 | `~/ome/caddy/Caddyfile` | Sends Bunny-authorized `/viewer-api/` requests to the service. |
-| `~/ome/player/index.html` | Sends the player heartbeat and optionally displays the count. |
+| `~/ome/player/index.html` | Sends the player heartbeat; it never displays the count. |
+| `~/ome/viewer-dashboard/index.html` | The separate operator-only page that displays the count. |
 
-Each browser tab creates a random ID in `sessionStorage`. Once playback reaches a live manifest it sends a heartbeat every 30 seconds. The service considers that ID active for 90 seconds, so a closed tab disappears automatically without a logout request.
+Each browser tab creates a random ID in `sessionStorage`. Once playback reaches a live manifest it sends a heartbeat every 30 seconds. The service considers that ID active for 90 seconds, so a closed tab disappears automatically without a logout request. Only the operator dashboard can request the resulting count.
 
 ### 11.1 Create the service files
 
@@ -853,8 +854,22 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 
 function pruneViewers() {
   const cutoff = Date.now() - viewerTtlMs;
-  for (const [viewerId, lastSeen] of viewers) {
-    if (lastSeen < cutoff) viewers.delete(viewerId);
+  for (const [viewerId, viewer] of viewers) {
+    if (viewer.lastSeen < cutoff) viewers.delete(viewerId);
+  }
+}
+
+function normaliseEmbedUrl(value) {
+  const unavailable = 'Direct player or referrer unavailable';
+  if (typeof value !== 'string' || !value) return unavailable;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return unavailable;
+    url.search = '';
+    url.hash = '';
+    return url.href;
+  } catch {
+    return unavailable;
   }
 }
 
@@ -875,8 +890,14 @@ const server = http.createServer((request, response) => {
 
   if (request.method === 'GET' && url.pathname === '/count') {
     pruneViewers();
+    const embedUrls = new Map();
+    for (const viewer of viewers.values()) {
+      embedUrls.set(viewer.embedUrl, (embedUrls.get(viewer.embedUrl) || 0) + 1);
+    }
     return sendJson(response, 200, {
       concurrentViewers: viewers.size,
+      embedUrls: [...embedUrls].map(([url, views]) => ({ url, views }))
+        .sort((a, b) => b.views - a.views || a.url.localeCompare(b.url)),
       heartbeatIntervalSeconds: heartbeatIntervalMs / 1000,
       activeWindowSeconds: viewerTtlMs / 1000
     });
@@ -894,12 +915,12 @@ const server = http.createServer((request, response) => {
   });
   request.on('end', () => {
     try {
-      const { viewerId } = JSON.parse(body);
+      const { viewerId, embedUrl } = JSON.parse(body);
       if (typeof viewerId !== 'string' || !uuid.test(viewerId)) {
         return sendJson(response, 400, { error: 'A valid viewerId is required' });
       }
       pruneViewers();
-      viewers.set(viewerId, Date.now());
+      viewers.set(viewerId, { lastSeen: Date.now(), embedUrl: normaliseEmbedUrl(embedUrl) });
       return sendJson(response, 204, {});
     } catch {
       return sendJson(response, 400, { error: 'Invalid JSON' });
@@ -930,15 +951,42 @@ CMD ["node", "server.js"]
 
 **Location: Origin SSH terminal. Working directory: `~/ome`**
 
-Edit `~/ome/caddy/Caddyfile`. Inside the existing `handle @bunny` block, add this handler **after** the `/player/` handler and **before** the final catch-all `handle`:
+Create a bcrypt password hash for the operator dashboard. Keep the password in a password manager; only the hash is placed in Caddy's configuration.
+
+```bash
+read -rsp "Dashboard password: " VIEWER_DASHBOARD_PASSWORD; echo
+sudo docker run --rm -e VIEWER_DASHBOARD_PASSWORD caddy:2.10.2 sh -c 'caddy hash-password --plaintext "$VIEWER_DASHBOARD_PASSWORD"'
+unset VIEWER_DASHBOARD_PASSWORD
+```
+
+Edit `~/ome/caddy/Caddyfile`. Inside the existing `handle @bunny` block, add these handlers **after** the `/player/` handler and **before** the final catch-all `handle`. Replace `PASTE_BCRYPT_HASH` with the command output. The first handler accepts player heartbeats only; the two dashboard handlers require the password and are the only route to `/count`.
 
 ```caddyfile
-        handle_path /viewer-api/* {
+        @viewerHeartbeat path /viewer-api/heartbeat
+        handle @viewerHeartbeat {
+            uri replace /viewer-api/heartbeat /heartbeat
             reverse_proxy viewer-count:3000
+        }
+        @otherViewerApi path /viewer-api/*
+        handle @otherViewerApi {
+            respond "Not found" 404
+        }
+        handle_path /viewer-dashboard/api/* {
+            basic_auth {
+                operator PASTE_BCRYPT_HASH
+            }
+            reverse_proxy viewer-count:3000
+        }
+        handle_path /viewer-dashboard/* {
+            basic_auth {
+                operator PASTE_BCRYPT_HASH
+            }
+            root * /srv/viewer-dashboard
+            file_server
         }
 ```
 
-The route remains protected by the existing Bunny `X-Origin-Verify` check. It does not expose port 3000 on the VM.
+The route remains protected by the existing Bunny `X-Origin-Verify` check. It does not expose port 3000 on the VM, and customers cannot request `/viewer-api/count`.
 
 Edit `~/ome/docker-compose.yml` and add this service at the same level as `ome` and `caddy`:
 
@@ -949,7 +997,13 @@ Edit `~/ome/docker-compose.yml` and add this service at the same level as `ome` 
     networks: [streaming]
 ```
 
-In the Bunny Pull Zone, add an Edge Rule for `*/viewer-api/*` that overrides both edge and browser cache time to `0` seconds. The service also sends `Cache-Control: no-store`; the rule makes the no-cache intent explicit at the CDN.
+Also add this read-only volume to the existing `caddy` service:
+
+```yaml
+      - ./viewer-dashboard:/srv/viewer-dashboard:ro
+```
+
+In the Bunny Pull Zone, add Edge Rules for both `*/viewer-api/*` and `*/viewer-dashboard/*` that override edge and browser cache time to `0` seconds. The service also sends `Cache-Control: no-store`; the rules make the no-cache intent explicit at the CDN.
 
 Build, validate, and start the changed services:
 
@@ -961,15 +1015,9 @@ sudo docker compose ps
 sudo docker compose logs --tail=50 viewer-count caddy
 ```
 
-### 11.3 Add heartbeats and the optional display to the player
+### 11.3 Send player heartbeats and create the private dashboard
 
 **Location: Origin SSH terminal. File: `~/ome/player/index.html`**
-
-Add this element in the `.controls` block, for example after the `LIVE` span:
-
-```html
-      <span id="viewerCount" aria-live="polite">0 watching</span>
-```
 
 Add the following constants immediately after the existing `const retryDelayMs = 10000;` line:
 
@@ -977,9 +1025,7 @@ Add the following constants immediately after the existing `const retryDelayMs =
     const viewerIdKey = 'omeViewerId';
     const viewerId = sessionStorage.getItem(viewerIdKey) || crypto.randomUUID();
     const viewerHeartbeatUrl = '/viewer-api/heartbeat';
-    const viewerCountUrl = '/viewer-api/count';
     const viewerHeartbeatMs = 30_000;
-    const viewerCount = document.querySelector('#viewerCount');
     let viewerTimer;
 ```
 
@@ -990,28 +1036,17 @@ Then add these functions before `function startStream()`:
       fetch(viewerHeartbeatUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ viewerId }),
+        body: JSON.stringify({ viewerId, embedUrl: document.referrer }),
         keepalive: true
       }).catch(function () {});
-    }
-
-    function refreshViewerCount() {
-      fetch(viewerCountUrl, { cache: 'no-store' })
-        .then(function (response) { return response.json(); })
-        .then(function (data) {
-          viewerCount.textContent = data.concurrentViewers + ' watching';
-        })
-        .catch(function () {});
     }
 
     function startViewerTracking() {
       if (viewerTimer) return;
       sessionStorage.setItem(viewerIdKey, viewerId);
       sendViewerHeartbeat();
-      refreshViewerCount();
       viewerTimer = setInterval(function () {
         sendViewerHeartbeat();
-        refreshViewerCount();
       }, viewerHeartbeatMs);
     }
 
@@ -1021,7 +1056,78 @@ Then add these functions before `function startStream()`:
     }
 ```
 
-Add `startViewerTracking();` as the final line in `showLive()`, and add `stopViewerTracking();` as the first line in `handleStreamOffline()`. This starts measurement only after the manifest is available and stops retries when the stream goes offline.
+Add `startViewerTracking();` as the final line in `showLive()`, and add `stopViewerTracking();` as the first line in `handleStreamOffline()`. This starts measurement only after the manifest is available and stops retries when the stream goes offline. `document.referrer` identifies the embedding page when the browser supplies it; the service removes query strings and fragments before storing it.
+
+Create the private dashboard page:
+
+```bash
+sudo install -d -m 755 -o deploy -g deploy "$HOME/ome/viewer-dashboard"
+nano ~/ome/viewer-dashboard/index.html
+```
+
+```html
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live stream operations</title>
+  <style>
+    body { background: #10131a; color: #eef2ff; font: 16px/1.5 system-ui, sans-serif; margin: 0; padding: 2rem; }
+    main { margin: auto; max-width: 960px; }
+    .total { color: #8be9fd; font-size: 1.25rem; }
+    #embedCards { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+    .card { background: #1e2635; border-radius: .75rem; padding: 1rem; }
+    .url { overflow-wrap: anywhere; }
+    .views { color: #8be9fd; font-size: 2rem; font-weight: 700; margin: .5rem 0 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Live stream operations</h1>
+    <p id="viewerCount" class="total" aria-live="polite">Loading viewer count...</p>
+    <section id="embedCards" aria-live="polite"></section>
+  </main>
+  <script>
+    const count = document.querySelector('#viewerCount');
+    const cards = document.querySelector('#embedCards');
+    function renderCards(embedUrls) {
+      cards.replaceChildren();
+      if (!embedUrls.length) {
+        cards.textContent = 'No active player sessions.';
+        return;
+      }
+      embedUrls.forEach(function (embed) {
+        const card = document.createElement('article');
+        card.className = 'card';
+        const url = document.createElement('div');
+        url.className = 'url';
+        url.textContent = embed.url;
+        const views = document.createElement('p');
+        views.className = 'views';
+        views.textContent = embed.views + (embed.views === 1 ? ' active view' : ' active views');
+        card.append(url, views);
+        cards.append(card);
+      });
+    }
+    async function refreshCount() {
+      try {
+        const response = await fetch('api/count', { cache: 'no-store' });
+        if (!response.ok) throw new Error('Count request failed');
+        const data = await response.json();
+        count.textContent = data.concurrentViewers + ' active player sessions';
+        renderCards(data.embedUrls);
+      } catch {
+        count.textContent = 'Viewer count is temporarily unavailable.';
+        cards.replaceChildren();
+      }
+    }
+    refreshCount();
+    setInterval(refreshCount, 30_000);
+  </script>
+</body>
+</html>
+```
 
 Recreate the services and test from an external device:
 
@@ -1031,11 +1137,9 @@ sudo docker compose up -d --build
 sudo docker compose logs --tail=50 viewer-count
 ```
 
-Open `https://player01.cockxing.online/player/` in two separate browser profiles or devices. After both reach `LIVE`, the display should become `2 watching` within 30 seconds. Close one tab and wait up to 90 seconds for it to disappear. For a direct API check, use the Bunny hostname, never the origin hostname:
+Open `https://player01.cockxing.online/player/` in two separate browser profiles or devices. Then open `https://player01.cockxing.online/viewer-dashboard/` in an operator browser and enter the Caddy username `operator` plus the dashboard password. Within 30 seconds it should show `2 active player sessions` and one card for each embedding URL. A customer who tries `https://player01.cockxing.online/viewer-api/count` receives `404`; a customer who tries the dashboard receives a password prompt.
 
-```bash
-curl https://player01.cockxing.online/viewer-api/count
-```
+Modern browsers commonly reduce a cross-site iframe referrer to its **origin**, such as `https://partner.example/`, and privacy settings can omit it altogether. That is intentional and safer than exposing visitor page paths or query strings; this guide also removes any query string and fragment. If partner-level reporting must be exact and tamper-resistant, have the authorizing backend in section 12 attach the verified partner ID or embed URL to the viewer session and use that server-side value instead of `document.referrer`.
 
 The in-memory map resets to zero when the `viewer-count` container restarts. That is correct for a concurrent counter. If you later run multiple origin instances, replace the `Map` with a shared Redis store using a 90-second TTL; otherwise each origin reports only its local viewers.
 
@@ -1142,7 +1246,7 @@ Complete these checks before calling the stream ready:
 - [ ] Playlist and media requests use `player01`, not the origin hostname.
 - [ ] `.m3u8` is not cached; `.m4s` has the intended TTL.
 - [ ] If protected, a valid short-lived token plays and an expired/missing token fails.
-- [ ] If the optional viewer counter is enabled, two live player sessions show `2 watching` and a closed tab expires within 90 seconds.
+- [ ] If the optional viewer counter is enabled, the password-protected dashboard shows two live player sessions and a closed tab expires within 90 seconds.
 - [ ] If embedded, every actual website origin is in `<CrossDomains>` and partner playback has no CORS error.
 - [ ] Tests from meaningful audience regions record startup time, rebuffer count, and live latency.
 
