@@ -65,7 +65,7 @@ Calculate the bill from the expected regional traffic mix. An even four-region s
 | **Cloudflare dashboard** | DNS records in the `v3stech.online` zone only. |
 | **Akamai Cloud Manager** | Account, region, Cloud Firewall, reserved IP, SSH-key, and VM configuration. |
 | **Administrator workstation** | A local terminal used to create/access the SSH key and connect to the origin. No Linode CLI is required. |
-| **Origin SSH terminal** | An SSH session to the Ubuntu VM as `root`. |
+| **Origin SSH terminal** | An SSH session to the Ubuntu VM, initially as `root` and then as `deploy`. |
 | **Bunny dashboard** | Pull Zone, custom hostname, Edge Rules, token authentication, and metrics. |
 | **vMix PC** | The Windows machine running vMix. |
 | **External test device** | A device/network other than the origin, ideally in each viewer region. |
@@ -173,19 +173,43 @@ ssh root@origin01.v3stech.online
 
 If SSH fails, verify that the workstation's current public IP is inside the administrator CIDR and that the Cloud Firewall is attached to the VM's public interface.
 
-> **SSH key troubleshooting:** The account is `root`. SSH uses the private key matching the administrator public key selected when creating the VM, so no root password is required. If Windows returns `Permission denied (publickey)`, confirm the matching key is available with `Get-ChildItem $HOME\.ssh`, then specify it explicitly:
+> **SSH key troubleshooting:** The initial account is `root`; the `deploy` account does not exist until Phase 2. SSH uses the private key matching the administrator public key selected when creating the VM, so no root password is required. If Windows returns `Permission denied (publickey)`, confirm the matching key is available with `Get-ChildItem $HOME\.ssh`, then specify it explicitly:
 >
 > ```powershell
 > ssh -i $HOME\.ssh\YOUR_PRIVATE_KEY root@origin01.v3stech.online
 > ```
 >
-> Keep this root session open for the remaining Ubuntu setup steps.
+> After the deployment-account commands below have completed, use the same key to connect as `deploy`.
 
 ## 6. Phase 2 - Prepare and secure Ubuntu
 
-### 6.1 Install the runtime and create directories
+### 6.1 Create a deployment account
 
-**Location: Origin SSH terminal as `root`. Working directory: root's home directory (`~`)**
+**Location: Origin SSH terminal**
+
+If this is the initial `root` login, create a restricted deployment workflow before installing software:
+
+```bash
+adduser deploy
+usermod -aG sudo deploy
+install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
+cp /root/.ssh/authorized_keys /home/deploy/.ssh/authorized_keys
+chown deploy:deploy /home/deploy/.ssh/authorized_keys
+chmod 600 /home/deploy/.ssh/authorized_keys
+exit
+```
+
+**Location: Administrator workstation**
+
+Reconnect as the deployment user:
+
+```bash
+ssh deploy@origin01.v3stech.online
+```
+
+### 6.2 Install the runtime and create directories
+
+**Location: Origin SSH terminal. Working directory: home directory (`~`)**
 
 Do not run a blanket OS upgrade during a production build. Install only the required packages and start Docker:
 
@@ -193,8 +217,8 @@ Do not run a blanket OS upgrade during a production build. Install only the requ
 sudo apt update
 sudo apt install -y docker.io docker-compose-v2 curl openssl ufw
 sudo systemctl enable --now docker
-install -d -m 750 -o root -g root "$HOME/ome/config" "$HOME/ome/caddy"
-install -d -m 755 -o root -g root "$HOME/ome/player"
+sudo install -d -m 750 -o deploy -g deploy "$HOME/ome/config" "$HOME/ome/caddy"
+sudo install -d -m 755 -o deploy -g deploy "$HOME/ome/player"
 docker compose version
 ```
 
@@ -211,7 +235,7 @@ sudo ufw enable
 sudo ufw status numbered
 ```
 
-### 6.2 Generate the origin request secret
+### 6.3 Generate the origin request secret
 
 **Location: Origin SSH terminal**
 
@@ -227,7 +251,7 @@ pwd
 
 Never put this value in source control, chat, screenshots, browser code, or a public ticket.
 
-### 6.3 Generate the SRT passphrase
+### 6.4 Generate the SRT passphrase
 
 **Location: Origin SSH terminal**
 
@@ -240,7 +264,7 @@ chmod 600 "$HOME/ome/config/srt-passphrase.txt"
 
 Never put this value in source control, chat, screenshots, browser code, or a public ticket.
 
-**Phase 2 gate:** `~/ome/config`, `~/ome/caddy`, `~/ome/player`, and the two mode-`600` secret files exist under the `root` account. The `player` directory is used only by the optional player UI in section 10.6.
+**Phase 2 gate:** `~/ome/config`, `~/ome/caddy`, `~/ome/player`, and the two mode-`600` secret files exist under the `deploy` account. The `player` directory is used only by the optional player UI in section 10.6.
 
 ## 7. Phase 3 - Configure OME
 
@@ -590,7 +614,7 @@ Safari and other native-HLS clients do not use the hls.js settings. For those cl
 The example uses a small custom control bar, so each UI element can be enabled or removed without relying on browser-specific native controls. Create the directory and file:
 
 ```bash
-install -d -m 755 -o root -g root "$HOME/ome/player"
+sudo install -d -m 755 -o deploy -g deploy "$HOME/ome/player"
 nano ~/ome/player/index.html
 ```
 
@@ -840,7 +864,7 @@ Each browser tab creates a random ID in `sessionStorage`. Once playback reaches 
 Create the directory and service file:
 
 ```bash
-install -d -m 755 -o root -g root "$HOME/ome/viewer-count"
+sudo install -d -m 755 -o deploy -g deploy "$HOME/ome/viewer-count"
 nano ~/ome/viewer-count/server.js
 ```
 
@@ -1065,7 +1089,7 @@ Add `startViewerTracking();` as the final line in `showLive()`, and add `stopVie
 Create the private dashboard page:
 
 ```bash
-install -d -m 755 -o root -g root "$HOME/ome/viewer-dashboard"
+sudo install -d -m 755 -o deploy -g deploy "$HOME/ome/viewer-dashboard"
 nano ~/ome/viewer-dashboard/index.html
 ```
 
