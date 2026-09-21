@@ -32,8 +32,8 @@ Complete this table before running commands. Commands deliberately use placehold
 
 | Item | Example / required value |
 |---|---|
-| Origin DNS name | `origin01.v3stech.online` |
-| Viewer DNS name | `stream.v3stech.online` |
+| Origin DNS name | `origin01.cockxing.online` |
+| Viewer DNS name | `player01.cockxing.online` |
 | Akamai region | Nearest region to vMix, for example `ap-south` |
 | VM label | `ome-origin01` |
 | VM plan | `g6-standard-2` (2 vCPU, 4 GB RAM) to start |
@@ -62,7 +62,7 @@ Calculate the bill from the expected regional traffic mix. An even four-region s
 
 | Location label | Use it for |
 |---|---|
-| **Cloudflare dashboard** | DNS records in the `v3stech.online` zone only. |
+| **Cloudflare dashboard** | DNS records in the `cockxing.online` zone only. |
 | **Akamai Cloud Manager** | Account, region, Cloud Firewall, reserved IP, SSH-key, and VM configuration. |
 | **Administrator workstation** | A local terminal used to create/access the SSH key and connect to the origin. No Linode CLI is required. |
 | **Origin SSH terminal** | An SSH session to the Ubuntu VM as `root`. |
@@ -74,7 +74,7 @@ Calculate the bill from the expected regional traffic mix. An even four-region s
 
 Before provisioning, confirm all of the following:
 
-- You control the `v3stech.online` DNS zone in Cloudflare.
+- You control the `cockxing.online` DNS zone in Cloudflare.
 - You have an Akamai Cloud account and an administrator SSH public key that you can add to Cloud Manager.
 - You know the administrator and vMix source public IP ranges. If either location uses changing IPs, use a fixed VPN egress range instead.
 - Ports 80 and 443 may be publicly reached during Caddy certificate issuance and by Bunny. UDP 9999 may be reached only from the vMix CIDR.
@@ -157,18 +157,18 @@ Before provisioning, confirm all of the following:
 
 ### 5.4 Create the origin DNS record
 
-**Location: Cloudflare dashboard -> `v3stech.online` -> DNS -> Records**
+**Location: Cloudflare dashboard -> `cockxing.online` -> DNS -> Records**
 
 1. Choose **Add record**.
 2. Create an `A` record with **Name** `origin01` and the reserved `ORIGIN_IPV4` address from step 5.3.
 3. Set **Proxy status** to **DNS only** (grey cloud), then save. Do not orange-cloud it: Bunny must connect to Caddy directly, and Caddy must complete its own TLS challenge.
 4. Use a temporary TTL such as 300 seconds while testing, if Cloudflare presents that option.
-5. Do not create `stream` here yet. It is created later as a Bunny-directed CNAME.
+5. Do not create `player01` here yet. It is created later as a Bunny-directed CNAME.
 
 **Phase 1 gate:** From the administrator workstation, confirm DNS resolves to the reserved address and SSH is reachable:
 
 ```bash
-ssh root@origin01.v3stech.online
+ssh root@origin01.cockxing.online
 ```
 
 If SSH fails, verify that the workstation's current public IP is inside the administrator CIDR and that the Cloud Firewall is attached to the VM's public interface.
@@ -176,7 +176,7 @@ If SSH fails, verify that the workstation's current public IP is inside the admi
 > **SSH key troubleshooting:** The account is `root`. SSH uses the private key matching the administrator public key selected when creating the VM, so no root password is required. If Windows returns `Permission denied (publickey)`, confirm the matching key is available with `Get-ChildItem $HOME\.ssh`, then specify it explicitly:
 >
 > ```powershell
-> ssh -i $HOME\.ssh\YOUR_PRIVATE_KEY root@origin01.v3stech.online
+> ssh -i $HOME\.ssh\YOUR_PRIVATE_KEY root@origin01.cockxing.online
 > ```
 >
 > Keep this root session open for the remaining Ubuntu setup steps.
@@ -305,7 +305,7 @@ nano ~/ome/config/Server.xml
               <PartHoldBack>3</PartHoldBack>
               <SegmentDuration>6</SegmentDuration>
               <SegmentCount>12</SegmentCount>
-              <CrossDomains><Url>https://stream.v3stech.online</Url></CrossDomains>
+              <CrossDomains><Url>https://player01.cockxing.online</Url></CrossDomains>
             </LLHLS>
           </Publishers>
         </Application>
@@ -344,7 +344,7 @@ nano ~/ome/caddy/Caddyfile
 3. Replace `PASTE_THE_SECRET_FROM_THE_FILE` with the exact copied secret, then save:
 
 ```caddyfile
-origin01.v3stech.online {
+origin01.cockxing.online {
     @bunny header X-Origin-Verify "PASTE_THE_SECRET_FROM_THE_FILE"
     handle @bunny {
         handle_path /player/* {
@@ -415,7 +415,7 @@ sudo docker compose ps
 sudo docker compose logs --tail=100 ome caddy
 ```
 
-Expected result: both services are running and Caddy has obtained a TLS certificate for `origin01.v3stech.online`. If Caddy fails to issue a certificate, check the DNS `A` record plus cloud-firewall access to TCP 80 and 443.
+Expected result: both services are running and Caddy has obtained a TLS certificate for `origin01.cockxing.online`. If Caddy fails to issue a certificate, check the DNS `A` record plus cloud-firewall access to TCP 80 and 443.
 
 ### 8.3 Confirm that the origin is gated
 
@@ -424,7 +424,7 @@ Expected result: both services are running and Caddy has obtained a TLS certific
 Run this unauthenticated request:
 
 ```bash
-curl -I https://origin01.v3stech.online/app/linear/llhls.m3u8
+curl -I https://origin01.cockxing.online/app/linear/llhls.m3u8
 ```
 
 **Phase 4 gate:** The response is `404`, not a playlist. Do not continue if stream content is publicly available from the origin.
@@ -481,7 +481,7 @@ Stop following the log with `Ctrl+C` after the stream appears. The external orig
 
 1. In the Bunny dashboard, click **+ Add** in the sidebar, then choose **Pull Zone**. (You can also open **CDN** and select **Add Pull Zone**.)
 2. Enter the Pull Zone name `player01`, or another unique alphanumeric name. This creates the temporary hostname `NAME.b-cdn.net`.
-3. For **Origin type**, choose **Origin URL**. Enter `https://origin01.v3stech.online` for **Origin URL** and `origin01.v3stech.online` for the optional **Host header**.
+3. For **Origin type**, choose **Origin URL**. Enter `https://origin01.cockxing.online` for **Origin URL** and `origin01.cockxing.online` for the optional **Host header**.
 4. Choose the **Standard** tier and select the delivery regions required by the audience: Europe/North America, Asia/Oceania, South America, and Middle East/Africa.
 5. Click **Add Pull Zone** to create it.
 6. Open the new Pull Zone. In **General**, confirm its origin URL and Host header, and retain origin SSL verification.
@@ -502,11 +502,11 @@ The value must remain a request secret. Never send it as a response header and n
 
 ### 10.3 Add the viewer hostname
 
-**Location: Bunny dashboard, then Cloudflare dashboard -> `v3stech.online` -> DNS -> Records**
+**Location: Bunny dashboard, then Cloudflare dashboard -> `cockxing.online` -> DNS -> Records**
 
-1. In the Pull Zone's **General** section, find the **Hostnames** panel. Enter `stream.v3stech.online` and click **Add hostname**.
+1. In the Pull Zone's **General** section, find the **Hostnames** panel. Enter `player01.cockxing.online` and click **Add hostname**.
 2. Copy the exact CNAME record value shown below the hostname field.
-3. In Cloudflare, add a `CNAME` record with **Name** `stream` and **Target** equal to Bunny's displayed target. Do not guess the target and do not point this record at the origin VM.
+3. In Cloudflare, add a `CNAME` record with **Name** `player01` and **Target** equal to Bunny's displayed target. Do not guess the target and do not point this record at the origin VM.
 4. Set Cloudflare **Proxy status** to **DNS only** (grey cloud) and save. Orange-clouding another CDN can introduce certificate or connectivity failures and inserts Cloudflare in front of Bunny.
 5. Return to Bunny and wait for the custom-hostname certificate to become active.
 
@@ -515,7 +515,7 @@ The value must remain a request secret. Never send it as a response header and n
 Confirm DNS and TLS:
 
 ```bash
-curl -I https://stream.v3stech.online/
+curl -I https://player01.cockxing.online/
 ```
 
 A `403` or `404` at `/` is expected because root access is blocked. A valid HTTPS connection is the success condition.
@@ -554,10 +554,10 @@ A `403` or `404` at `/` is expected because root access is blocked. A valid HTTP
 **Phase 6 gate:** From an external device, open the viewer URL in an LL-HLS-capable player or test page:
 
 ```text
-https://stream.v3stech.online/app/linear/llhls.m3u8
+https://player01.cockxing.online/app/linear/llhls.m3u8
 ```
 
-Video and audio should begin. Browser/player requests for both the playlist and `.m4s` files must go to `stream.v3stech.online`, never `origin01.v3stech.online`.
+Video and audio should begin. Browser/player requests for both the playlist and `.m4s` files must go to `player01.cockxing.online`, never `origin01.cockxing.online`.
 
 ### 10.5 Startup stutter tuning
 
@@ -585,7 +585,7 @@ Safari and other native-HLS clients do not use the hls.js settings. For those cl
 
 **Location: Origin SSH terminal. Working directory: `~/ome`**
 
-`stream.v3stech.online` is Bunny's custom hostname, not a separate web host. The Caddy and Compose configuration in Phase 4 therefore gives Bunny an authorized `/player/` origin path for this static page. The Compose bind mount maps the origin VM folder `~/ome/player` to `/srv/player` **inside the Caddy container**, read-only. Viewers load it through Bunny at `https://stream.v3stech.online/player/`; they must never use `https://origin01.v3stech.online/player/`.
+`player01.cockxing.online` is Bunny's custom hostname, not a separate web host. The Caddy and Compose configuration in Phase 4 therefore gives Bunny an authorized `/player/` origin path for this static page. The Compose bind mount maps the origin VM folder `~/ome/player` to `/srv/player` **inside the Caddy container**, read-only. Viewers load it through Bunny at `https://player01.cockxing.online/player/`; they must never use `https://origin01.cockxing.online/player/`.
 
 The example uses a small custom control bar, so each UI element can be enabled or removed without relying on browser-specific native controls. Create the directory and file:
 
@@ -1239,7 +1239,7 @@ sudo docker compose up -d --build
 sudo docker compose logs --tail=50 viewer-count
 ```
 
-Open `https://stream.v3stech.online/player/` in two separate browser profiles or devices. Then open `https://stream.v3stech.online/viewer-dashboard/` in an operator browser and enter the Caddy username `operator` plus the dashboard password. Within 30 seconds it should show `2 active player sessions` and one card for each embedding URL. A customer who tries `https://stream.v3stech.online/viewer-api/count` receives `404`; a customer who tries the dashboard receives a password prompt.
+Open `https://player01.cockxing.online/player/` in two separate browser profiles or devices. Then open `https://player01.cockxing.online/viewer-dashboard/` in an operator browser and enter the Caddy username `operator` plus the dashboard password. Within 30 seconds it should show `2 active player sessions` and one card for each embedding URL. A customer who tries `https://player01.cockxing.online/viewer-api/count` receives `404`; a customer who tries the dashboard receives a password prompt.
 
 Modern browsers commonly reduce a cross-site iframe referrer to its **origin**, such as `https://partner.example/`, and privacy settings can omit it altogether. That is intentional and safer than exposing visitor page paths or query strings; this guide also removes any query string and fragment. If partner-level reporting must be exact and tamper-resistant, have the authorizing backend in section 12 attach the verified partner ID or embed URL to the viewer session and use that server-side value instead of `document.referrer`.
 
@@ -1272,7 +1272,7 @@ For each viewing session:
 
 | Signer input | Value |
 |---|---|
-| Base URL | `https://stream.v3stech.online/app/linear/llhls.m3u8` |
+| Base URL | `https://player01.cockxing.online/app/linear/llhls.m3u8` |
 | Token type | Path-based directory token |
 | Token path | `/app/linear/` |
 | Expiry | 5-15 minutes, matching the viewing-session design |
@@ -1295,11 +1295,11 @@ The static page in section 10.6 does not know how to obtain this URL by itself. 
 nano ~/ome/config/Server.xml
 ```
 
-3. Under `<CrossDomains>`, retain `stream.v3stech.online` if it hosts a player page and add one `<Url>` per permitted embed origin:
+3. Under `<CrossDomains>`, retain `player01.cockxing.online` if it hosts a player page and add one `<Url>` per permitted embed origin:
 
 ```xml
 <CrossDomains>
-  <Url>https://stream.v3stech.online</Url>
+  <Url>https://player01.cockxing.online</Url>
   <Url>https://www.partner.example</Url>
 </CrossDomains>
 ```
@@ -1347,7 +1347,7 @@ Complete these checks before calling the stream ready:
 - [ ] vMix sends encrypted SRT using `default/app/linear`; OME logs confirm the live input.
 - [ ] Caddy and OME containers remain running after a restart.
 - [ ] Bunny sends `X-Origin-Verify`; the viewer hostname has a valid certificate and plays the stream.
-- [ ] Playlist and media requests use `stream`, not the origin hostname.
+- [ ] Playlist and media requests use `player01`, not the origin hostname.
 - [ ] `.m3u8` is not cached; `.m4s` has the intended TTL.
 - [ ] If protected, a valid short-lived token plays and an expired/missing token fails.
 - [ ] If the optional viewer counter is enabled, the password-protected dashboard shows two live player sessions and a closed tab expires within 90 seconds.
