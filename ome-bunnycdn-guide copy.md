@@ -33,7 +33,7 @@ Complete this table before running commands. Commands deliberately use placehold
 | Item | Example / required value |
 |---|---|
 | Origin DNS name | `origin01.cockxing.online` |
-| Viewer DNS name | `player01.cockxing.online` |
+| Viewer DNS name | `stream.v3stech.online` |
 | Akamai region | Nearest region to vMix, for example `ap-south` |
 | VM label | `ome-origin01` |
 | VM plan | `g6-standard-2` (2 vCPU, 4 GB RAM) to start |
@@ -163,7 +163,7 @@ Before provisioning, confirm all of the following:
 2. Create an `A` record with **Name** `origin01` and the reserved `ORIGIN_IPV4` address from step 5.3.
 3. Set **Proxy status** to **DNS only** (grey cloud), then save. Do not orange-cloud it: Bunny must connect to Caddy directly, and Caddy must complete its own TLS challenge.
 4. Use a temporary TTL such as 300 seconds while testing, if Cloudflare presents that option.
-5. Do not create `player01` here yet. It is created later as a Bunny-directed CNAME.
+5. Do not create `stream` here yet. It is created later as a Bunny-directed CNAME.
 
 **Phase 1 gate:** From the administrator workstation, confirm DNS resolves to the reserved address and SSH is reachable:
 
@@ -329,7 +329,7 @@ nano ~/ome/config/Server.xml
               <PartHoldBack>1.5</PartHoldBack>
               <SegmentDuration>6</SegmentDuration>
               <SegmentCount>10</SegmentCount>
-              <CrossDomains><Url>https://player01.cockxing.online</Url></CrossDomains>
+              <CrossDomains><Url>https://stream.v3stech.online</Url></CrossDomains>
             </LLHLS>
           </Publishers>
         </Application>
@@ -528,9 +528,9 @@ The value must remain a request secret. Never send it as a response header and n
 
 **Location: Bunny dashboard, then Cloudflare dashboard -> `cockxing.online` -> DNS -> Records**
 
-1. In the Pull Zone's **General** section, find the **Hostnames** panel. Enter `player01.cockxing.online` and click **Add hostname**.
+1. In the Pull Zone's **General** section, find the **Hostnames** panel. Enter `stream.v3stech.online` and click **Add hostname**.
 2. Copy the exact CNAME record value shown below the hostname field.
-3. In Cloudflare, add a `CNAME` record with **Name** `player01` and **Target** equal to Bunny's displayed target. Do not guess the target and do not point this record at the origin VM.
+3. In Cloudflare, add a `CNAME` record with **Name** `stream` and **Target** equal to Bunny's displayed target. Do not guess the target and do not point this record at the origin VM.
 4. Set Cloudflare **Proxy status** to **DNS only** (grey cloud) and save. Orange-clouding another CDN can introduce certificate or connectivity failures and inserts Cloudflare in front of Bunny.
 5. Return to Bunny and wait for the custom-hostname certificate to become active.
 
@@ -539,7 +539,7 @@ The value must remain a request secret. Never send it as a response header and n
 Confirm DNS and TLS:
 
 ```bash
-curl -I https://player01.cockxing.online/
+curl -I https://stream.v3stech.online/
 ```
 
 A `403` or `404` at `/` is expected because root access is blocked. A valid HTTPS connection is the success condition.
@@ -578,16 +578,16 @@ A `403` or `404` at `/` is expected because root access is blocked. A valid HTTP
 **Phase 6 gate:** From an external device, open the viewer URL in an LL-HLS-capable player or test page:
 
 ```text
-https://player01.cockxing.online/app/linear/llhls.m3u8
+https://stream.v3stech.online/app/linear/llhls.m3u8
 ```
 
-Video and audio should begin. Browser/player requests for both the playlist and `.m4s` files must go to `player01.cockxing.online`, never `origin01.cockxing.online`.
+Video and audio should begin. Browser/player requests for both the playlist and `.m4s` files must go to `stream.v3stech.online`, never `origin01.cockxing.online`.
 
 ### 10.5 Optional - Create an editable player UI
 
 **Location: Origin SSH terminal. Working directory: `~/ome`**
 
-`player01.cockxing.online` is Bunny's custom hostname, not a separate web host. The Caddy and Compose configuration in Phase 4 therefore gives Bunny an authorized `/player/` origin path for this static page. The Compose bind mount maps the origin VM folder `~/ome/player` to `/srv/player` **inside the Caddy container**, read-only. Viewers load it through Bunny at `https://player01.cockxing.online/player/`; they must never use `https://origin01.cockxing.online/player/`.
+`stream.v3stech.online` is Bunny's custom hostname, not a separate web host. The Caddy and Compose configuration in Phase 4 therefore gives Bunny an authorized `/player/` origin path for this static page. The Compose bind mount maps the origin VM folder `~/ome/player` to `/srv/player` **inside the Caddy container**, read-only. Viewers load it through Bunny at `https://stream.v3stech.online/player/`; they must never use `https://origin01.cockxing.online/player/`.
 
 The example uses a small custom control bar, so each UI element can be enabled or removed without relying on browser-specific native controls. Create the directory and file:
 
@@ -1137,7 +1137,7 @@ sudo docker compose up -d --build
 sudo docker compose logs --tail=50 viewer-count
 ```
 
-Open `https://player01.cockxing.online/player/` in two separate browser profiles or devices. Then open `https://player01.cockxing.online/viewer-dashboard/` in an operator browser and enter the Caddy username `operator` plus the dashboard password. Within 30 seconds it should show `2 active player sessions` and one card for each embedding URL. A customer who tries `https://player01.cockxing.online/viewer-api/count` receives `404`; a customer who tries the dashboard receives a password prompt.
+Open `https://stream.v3stech.online/player/` in two separate browser profiles or devices. Then open `https://stream.v3stech.online/viewer-dashboard/` in an operator browser and enter the Caddy username `operator` plus the dashboard password. Within 30 seconds it should show `2 active player sessions` and one card for each embedding URL. A customer who tries `https://stream.v3stech.online/viewer-api/count` receives `404`; a customer who tries the dashboard receives a password prompt.
 
 Modern browsers commonly reduce a cross-site iframe referrer to its **origin**, such as `https://partner.example/`, and privacy settings can omit it altogether. That is intentional and safer than exposing visitor page paths or query strings; this guide also removes any query string and fragment. If partner-level reporting must be exact and tamper-resistant, have the authorizing backend in section 12 attach the verified partner ID or embed URL to the viewer session and use that server-side value instead of `document.referrer`.
 
@@ -1170,7 +1170,7 @@ For each viewing session:
 
 | Signer input | Value |
 |---|---|
-| Base URL | `https://player01.cockxing.online/app/linear/llhls.m3u8` |
+| Base URL | `https://stream.v3stech.online/app/linear/llhls.m3u8` |
 | Token type | Path-based directory token |
 | Token path | `/app/linear/` |
 | Expiry | 5-15 minutes, matching the viewing-session design |
@@ -1191,11 +1191,11 @@ For each viewing session:
 nano ~/ome/config/Server.xml
 ```
 
-3. Under `<CrossDomains>`, retain `player01.cockxing.online` if it hosts a player page and add one `<Url>` per permitted embed origin:
+3. Under `<CrossDomains>`, retain `stream.v3stech.online` if it hosts a player page and add one `<Url>` per permitted embed origin:
 
 ```xml
 <CrossDomains>
-  <Url>https://player01.cockxing.online</Url>
+  <Url>https://stream.v3stech.online</Url>
   <Url>https://www.partner.example</Url>
 </CrossDomains>
 ```
@@ -1243,7 +1243,7 @@ Complete these checks before calling the stream ready:
 - [ ] vMix sends encrypted SRT using `default/app/linear`; OME logs confirm the live input.
 - [ ] Caddy and OME containers remain running after a restart.
 - [ ] Bunny sends `X-Origin-Verify`; the viewer hostname has a valid certificate and plays the stream.
-- [ ] Playlist and media requests use `player01`, not the origin hostname.
+- [ ] Playlist and media requests use `stream`, not the origin hostname.
 - [ ] `.m3u8` is not cached; `.m4s` has the intended TTL.
 - [ ] If protected, a valid short-lived token plays and an expired/missing token fails.
 - [ ] If the optional viewer counter is enabled, the password-protected dashboard shows two live player sessions and a closed tab expires within 90 seconds.
