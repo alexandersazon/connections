@@ -1053,12 +1053,10 @@ CMD ["node", "server.js"]
 
 **Location: Origin SSH terminal. Working directory: `~/ome`**
 
-Create a bcrypt password hash for the operator dashboard. Keep the password in a password manager; only the hash is placed in Caddy's configuration.
+Create a bcrypt password hash for the operator dashboard. Keep the password in a password manager; only the hash is placed in Caddy's configuration. Run this interactively and enter the same password when prompted twice; nothing is displayed while typing.
 
 ```bash
-read -rsp "Dashboard password: " VIEWER_DASHBOARD_PASSWORD; echo
-sudo docker run --rm -e VIEWER_DASHBOARD_PASSWORD caddy:2.10.2 sh -c 'caddy hash-password --plaintext "$VIEWER_DASHBOARD_PASSWORD"'
-unset VIEWER_DASHBOARD_PASSWORD
+sudo docker run --rm -it --entrypoint caddy caddy:2.10.2 hash-password
 ```
 
 Edit `~/ome/caddy/Caddyfile`. Inside the existing `handle @bunny` block, add these handlers **after** the `/player/` handler and **before** the final catch-all `handle`. Replace `PASTE_BCRYPT_HASH` with the command output. The first handler accepts player heartbeats only; the two dashboard handlers require the password and are the only route to `/count`.
@@ -1090,32 +1088,71 @@ Edit `~/ome/caddy/Caddyfile`. Inside the existing `handle @bunny` block, add the
 
 The route remains protected by the existing Bunny `X-Origin-Verify` check. It does not expose port 3000 on the VM, and customers cannot request `/viewer-api/count`.
 
-Edit `~/ome/docker-compose.yml` and add this service at the same level as `ome` and `caddy`:
+Back up the Compose file before editing it:
+
+```bash
+cd ~/ome
+cp docker-compose.yml docker-compose.yml.bak
+install -d -m 755 -o root -g root "$HOME/ome/viewer-dashboard"
+```
+
+Edit `~/ome/docker-compose.yml`:
+
+1. Keep the top-level `services:` line unchanged.
+2. Add `viewer-count` under `services:` with exactly two spaces before `viewer-count`. It must be aligned with `ome:` and `caddy:`, not nested inside either service.
+3. Add the dashboard bind mount under the existing `caddy.volumes` list with exactly six spaces before `-`. It must be aligned with the other `caddy` volume entries.
+
+The resulting structure should contain these sections:
 
 ```yaml
+services:
+  ome:
+    # existing OME settings remain here
+
+  caddy:
+    # existing Caddy settings remain here
+    volumes:
+      # existing Caddy volumes remain here
+      - ./viewer-dashboard:/srv/viewer-dashboard:ro
+
   viewer-count:
     build: ./viewer-count
     restart: unless-stopped
     networks: [streaming]
 ```
 
-Also add this read-only volume to the existing `caddy` service:
+Do not add a second `services:` key or a second `networks:` key. Do not add a `ports:` entry to `viewer-count`; it must remain reachable only through the private `streaming` network.
+
+Confirm the service and mount are present before starting containers:
 
 ```yaml
-      - ./viewer-dashboard:/srv/viewer-dashboard:ro
+grep -nE '^  (ome|caddy|viewer-count):|viewer-dashboard:/srv/viewer-dashboard|networks:' ~/ome/docker-compose.yml
+sudo docker compose config --quiet
+sudo docker compose config --services
 ```
 
-In the Bunny Pull Zone, add Edge Rules for both `*/viewer-api/*` and `*/viewer-dashboard/*` that override edge and browser cache time to `0` seconds. The service also sends `Cache-Control: no-store`; the rules make the no-cache intent explicit at the CDN.
+The final command must list `ome`, `caddy`, and `viewer-count`. If the YAML validation fails, fix indentation or duplicate keys before continuing. `docker-compose.yml.bak` is available if you need to compare the edited file.
+
+In the Bunny Pull Zone, add two separate Edge Rules. For each rule, use **Request URL** as the condition and set the pattern as follows:
+
+| Rule | Request URL pattern | Override Cache Time | Override Browser Cache Time |
+|---|---|---:|---:|
+| Viewer API | `*/viewer-api/*` | `0` seconds | `0` seconds |
+| Viewer dashboard | `*/viewer-dashboard/*` | `0` seconds | `0` seconds |
+
+Save and enable both rules. The service also sends `Cache-Control: no-store`; the rules make the no-cache intent explicit at the CDN. Do not add a cache rule that ignores query strings when token authentication is enabled.
 
 Build, validate, and start the changed services:
 
 ```bash
 cd ~/ome
 sudo docker compose config --quiet
-sudo docker compose up -d --build
+sudo docker compose up -d --build viewer-count caddy
 sudo docker compose ps
 sudo docker compose logs --tail=50 viewer-count caddy
 ```
+
+Expected result: `viewer-count` and `caddy` show `running`, the viewer-count log says `viewer-count listening on 3000`, and the Caddy log has no configuration or upstream errors. If the dashboard directory was missing, the `install -d` command above prevents Docker from creating it with the wrong type or ownership.
 
 ### 11.3 Send player heartbeats and create the private dashboard
 
