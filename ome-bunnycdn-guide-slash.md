@@ -914,9 +914,36 @@ When no live manifest is available, a full-frame `WAIT FOR THE LIVE STREAM` mess
 
 The current OME configuration is a single 720p bypass output, so it exposes only one HLS rendition. The resolution menu therefore remains hidden with this guide's default stream. A UI cannot create 480p/720p/1080p choices: configure a multi-variant HLS playlist from multiple encoder outputs or a transcoding workflow first. When that playlist has two or more variants, hls.js populates the menu and `Auto` retains adaptive-bitrate selection; a forced resolution can cause a short rebuffer while the player switches levels.
 
-## 11. Optional - Add a concurrent-viewer count
+## 11. Remove the concurrent-viewer count
 
-This section adds a **current active-player-session** count. It is not Bunny's total-view metric and must not be used for billing, prizes, or attendance: a browser can be duplicated or automated. Use Bunny Pull Zone analytics for delivery, traffic, and historical reporting. The count is shown only on a separate, password-protected operator dashboard; customers using the player never see it.
+This deployment does not use the optional concurrent-viewer counter. Remove it completely so the player sends no heartbeat, the origin runs no `viewer-count` container, and Caddy exposes no dashboard or viewer-count API.
+
+**Location: Origin SSH terminal. Working directory: `~/ome`**
+
+1. Remove the heartbeat code from `~/ome/player/index.html`: delete `viewerIdKey`, `viewerId`, `viewerHeartbeatUrl`, `viewerHeartbeatMs`, and `viewerTimer`; delete `sendViewerHeartbeat()`, `startViewerTracking()`, and `stopViewerTracking()`; remove `startViewerTracking();` from `showLive()` and `stopViewerTracking();` from `handleStreamOffline()`.
+2. Remove the `viewer-count` service from `~/ome/docker-compose.yml`, and remove the `./viewer-dashboard:/srv/viewer-dashboard:ro` volume from Caddy.
+3. Remove the `@viewerHeartbeat`, `@otherViewerApi`, `/viewer-dashboard/api/*`, and `/viewer-dashboard/*` handlers from `~/ome/caddy/Caddyfile`. Keep the existing `/player/` handler and final catch-all unchanged.
+4. Stop and remove the service, then recreate Caddy:
+
+```bash
+cd ~/ome
+sudo docker compose config --quiet
+sudo docker compose rm -sf viewer-count
+sudo docker compose up -d --force-recreate caddy
+sudo docker compose ps
+```
+
+5. Remove the unused files and directories:
+
+```bash
+sudo rm -rf ~/ome/viewer-count ~/ome/viewer-dashboard
+```
+
+6. In Bunny, delete or disable the `*/viewer-api/*` and `*/viewer-dashboard/*` Edge Rules. Keep the normal player and media caching rules.
+
+Verify that the player no longer sends heartbeat requests and that `/viewer-dashboard/` is no longer an enabled application route. Bunny analytics remains available for request, bandwidth, and delivery metrics, but this setup no longer reports concurrent viewers.
+
+The remainder of this section is historical reference only. Do not deploy it after completing the removal steps above. It describes the retired **current active-player-session** count, which was never Bunny's total-view metric.
 
 Use **JavaScript on Node.js 22**. It fits the existing browser JavaScript player, runs in a small container, needs no external package manager, and remains on the private Docker network. The files are all kept under `~/ome/viewer-count` on the origin:
 
@@ -931,7 +958,20 @@ Use **JavaScript on Node.js 22**. It fits the existing browser JavaScript player
 
 Each browser tab creates a random ID in `sessionStorage`. Once playback reaches a live manifest it sends a heartbeat every 30 seconds. The service considers that ID active for 90 seconds, so a closed tab disappears automatically without a logout request. Only the operator dashboard can request the resulting count. Because the heartbeat is unauthenticated, any viewer can forge IDs or embed URLs; this is a best-effort operational estimate, not an authoritative audience or billing metric.
 
-### 11.1 Create the service files
+An embedded player is counted too: the heartbeat code runs inside `~/ome/player/index.html`, so it runs when that page is loaded as an iframe and does not depend on JavaScript in the parent page. The dashboard groups that session under the iframe's `document.referrer` when the browser supplies one. To display the protected count inside an operator page, embed the dashboard itself rather than exposing `/viewer-api/count`:
+
+```html
+<iframe
+  src="https://stream.v3stech.online/viewer-dashboard/"
+  title="Live stream operations"
+  loading="lazy"
+  width="960"
+  height="640"></iframe>
+```
+
+The operator must still authenticate to the dashboard. A customer-facing page must not embed the dashboard or call its API.
+
+### Historical reference only - retired service files
 
 **Location: Origin SSH terminal. Working directory: `~/ome`**
 
@@ -1049,7 +1089,7 @@ EXPOSE 3000
 CMD ["node", "server.js"]
 ```
 
-### 11.2 Route the service through Caddy and Compose
+### Historical reference only - retired Caddy and Compose routes
 
 **Location: Origin SSH terminal. Working directory: `~/ome`**
 
@@ -1154,7 +1194,7 @@ sudo docker compose logs --tail=50 viewer-count caddy
 
 Expected result: `viewer-count` and `caddy` show `running`, the viewer-count log says `viewer-count listening on 3000`, and the Caddy log has no configuration or upstream errors. If the dashboard directory was missing, the `install -d` command above prevents Docker from creating it with the wrong type or ownership.
 
-### 11.3 Send player heartbeats and create the private dashboard
+### Historical reference only - retired player heartbeat and dashboard
 
 **Location: Origin SSH terminal. File: `~/ome/player/index.html`**
 
@@ -1276,7 +1316,7 @@ sudo docker compose up -d --build
 sudo docker compose logs --tail=50 viewer-count
 ```
 
-Open `https://stream.v3stech.online/player/` in two separate browser profiles or devices. Then open `https://stream.v3stech.online/viewer-dashboard/` in an operator browser and enter the Caddy username `operator` plus the dashboard password. Within 30 seconds it should show `2 active player sessions` and one card for each embedding URL. A customer who tries `https://stream.v3stech.online/viewer-api/count` receives `404`; a customer who tries the dashboard receives a password prompt.
+Open `https://stream.v3stech.online/player/` directly in one browser and as an iframe in a permitted partner page in another browser or profile. Then open `https://stream.v3stech.online/viewer-dashboard/` in an operator browser, or embed that dashboard URL in an operator page, and enter the Caddy username `operator` plus the dashboard password. Within 30 seconds it should show `2 active player sessions` and one card for each embedding URL. A customer who tries `https://stream.v3stech.online/viewer-api/count` receives `404`; a customer who tries the dashboard receives a password prompt.
 
 Modern browsers commonly reduce a cross-site iframe referrer to its **origin**, such as `https://partner.example/`, and privacy settings can omit it altogether. That is intentional and safer than exposing visitor page paths or query strings; this guide also removes any query string and fragment. If partner-level reporting must be exact and tamper-resistant, have the authorizing backend in section 12 attach the verified partner ID or embed URL to the viewer session and use that server-side value instead of `document.referrer`.
 
@@ -1387,7 +1427,7 @@ Complete these checks before calling the stream ready:
 - [ ] Playlist and media requests use `stream`, not the origin hostname.
 - [ ] `.m3u8` is not cached; `.m4s` has the intended TTL.
 - [ ] If protected, a valid short-lived token plays and an expired/missing token fails.
-- [ ] If the optional viewer counter is enabled, the password-protected dashboard shows two live player sessions and a closed tab expires within 90 seconds.
+- [ ] The retired concurrent-viewer counter is removed from the player, Compose, Caddy, and Bunny configuration.
 - [ ] If embedded, every actual website origin is in `<CrossDomains>` and partner playback has no CORS error.
 - [ ] Tests from meaningful audience regions record startup time, rebuffer count, and live latency.
 
