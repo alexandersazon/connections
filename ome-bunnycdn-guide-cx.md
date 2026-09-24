@@ -914,38 +914,340 @@ When no live manifest is available, a full-frame `WAIT FOR THE LIVE STREAM` mess
 
 The current OME configuration is a single 720p bypass output, so it exposes only one HLS rendition. The resolution menu therefore remains hidden with this guide's default stream. A UI cannot create 480p/720p/1080p choices: configure a multi-variant HLS playlist from multiple encoder outputs or a transcoding workflow first. When that playlist has two or more variants, hls.js populates the menu and `Auto` retains adaptive-bitrate selection; a forced resolution can cause a short rebuffer while the player switches levels.
 
-## 11. Remove the concurrent-viewer count
+## 11. Run the concurrent-viewer counter on another server
 
-This deployment does not use the optional concurrent-viewer counter. Remove it completely so the player sends no heartbeat, the origin runs no `viewer-count` container, and Caddy exposes no dashboard or viewer-count API.
+Keep the counter away from the video origin so heartbeat and dashboard traffic cannot compete with OME, Caddy, or the stream connection. Use the separate counter server hostname `count.cockxing.online`. This remains a best-effort active-session estimate, not Bunny's total-view metric or a billing/attendance system.
 
-**Location: Origin SSH terminal. Working directory: `~/ome`**
+The final architecture is:
 
-1. Remove the heartbeat code from `~/ome/player/index.html`: delete `viewerIdKey`, `viewerId`, `viewerHeartbeatUrl`, `viewerHeartbeatMs`, and `viewerTimer`; delete `sendViewerHeartbeat()`, `startViewerTracking()`, and `stopViewerTracking()`; remove `startViewerTracking();` from `showLive()` and `stopViewerTracking();` from `handleStreamOffline()`.
-2. Remove the `viewer-count` service from `~/ome/docker-compose.yml`, and remove the `./viewer-dashboard:/srv/viewer-dashboard:ro` volume from Caddy.
-3. Remove the `@viewerHeartbeat`, `@otherViewerApi`, `/viewer-dashboard/api/*`, and `/viewer-dashboard/*` handlers from `~/ome/caddy/Caddyfile`. Keep the existing `/player/` handler and final catch-all unchanged.
-4. Stop and remove the service, then recreate Caddy:
-
-```bash
-cd ~/ome
-sudo docker compose config --quiet
-sudo docker compose rm -sf viewer-count
-sudo docker compose up -d --force-recreate caddy
-sudo docker compose ps
+```text
+Browser player iframe -> https://count.cockxing.online/heartbeat -> counter server
+Operator dashboard -> https://count.cockxing.online/count -> counter server
+Video playlist and segments -> Bunny -> streaming origin
 ```
 
-5. Remove the unused files and directories:
+Use a separate VM or managed service. Do not point `count.cockxing.online` at the streaming origin. The counter needs only small JSON requests and can run on a minimal instance. Keep its firewall limited to TCP 80/443 and administrator SSH, and use HTTPS before enabling browser requests.
+
+### 11.1 Deploy the counter on the separate server
+
+**Location: Separate counter server**
+
+#### Configure `count.cockxing.online` in Cloudflare
+
+**Location: Cloudflare dashboard**
+
+1. Open the `v3stech.online` zone and go to **DNS -> Records**.
+2. Add an `A` record with **Name** `count`, **IPv4 address** set to the counter server public IP, and **TTL** set to `Auto`.
+3. Start with **Proxy status: DNS only** (grey cloud). This lets Caddy obtain its certificate directly. Do not point the record at the streaming origin.
+4. Verify DNS from an external machine:
 
 ```bash
-sudo rm -rf ~/ome/viewer-count ~/ome/viewer-dashboard
+dig +short count.cockxing.online
 ```
 
-6. In Bunny, delete or disable the `*/viewer-api/*` and `*/viewer-dashboard/*` Edge Rules. Keep the normal player and media caching rules.
+After direct HTTPS works, you may enable the orange-cloud proxy. If proxied, set **SSL/TLS -> Overview** to **Full (strict)** and install a valid certificate on the counter server. Never use **Flexible** SSL.
 
-Verify that the player no longer sends heartbeat requests and that `/viewer-dashboard/` is no longer an enabled application route. Bunny analytics remains available for request, bandwidth, and delivery metrics, but this setup no longer reports concurrent viewers.
+Add a Cloudflare Cache Rule for `count.cockxing.online/*` with **Cache eligibility: Bypass cache**. Do not cache `/heartbeat`, `/count`, or `/healthz`; these responses must remain live and send `Cache-Control: no-store`.
 
-The remainder of this section is historical reference only. Do not deploy it after completing the removal steps above. It describes the retired **current active-player-session** count, which was never Bunny's total-view metric.
+Do not enable Cloudflare Access, a browser challenge, or a JavaScript challenge on `/heartbeat`; they can block `fetch()` and CORS preflight requests. WAF rate limits must allow `OPTIONS` and `POST /heartbeat`. Protect `/dashboard/` and `/count` with the Basic Authentication configured below.
 
-Use **JavaScript on Node.js 22**. It fits the existing browser JavaScript player, runs in a small container, needs no external package manager, and remains on the private Docker network. The files are all kept under `~/ome/viewer-count` on the origin:
+Use a separate VM with Node.js 22, Docker, and Caddy installed. Do not point this hostname at the streaming origin.
+
+Create the service:
+
+```bash
+sudo install -d -m 755 /opt/viewer-count
+sudo nano /opt/viewer-count/server.js
+```
+
+Paste this complete file:
+
+```js
+const http = require('node:http');
+
+const port = 3000;
+const heartbeatIntervalMs = 30_000;
+const viewerTtlMs = 90_000;
+const maxBodyBytes = 2_048;
+const viewers = new Map();
+const allowedOrigins = new Set(['https://player01.cockxing.online']);
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function pruneViewers() {
+  const cutoff = Date.now() - viewerTtlMs;
+  for (const [viewerId, viewer] of viewers) {
+    if (viewer.lastSeen < cutoff) viewers.delete(viewerId);
+  }
+}
+
+function normaliseEmbedUrl(value) {
+  if (typeof value !== 'string' || !value) return 'Direct player or referrer unavailable';
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return 'Direct player or referrer unavailable';
+    url.search = '';
+    url.hash = '';
+    return url.href;
+  } catch {
+    return 'Direct player or referrer unavailable';
+  }
+}
+
+function setCors(response, origin) {
+  if (allowedOrigins.has(origin)) {
+    response.setHeader('Access-Control-Allow-Origin', origin);
+    response.setHeader('Vary', 'Origin');
+  }
+  response.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+}
+
+function sendJson(response, status, body, origin) {
+  setCors(response, origin);
+  response.writeHead(status, {
+    'Cache-Control': 'no-store',
+    'Content-Type': 'application/json; charset=utf-8'
+  });
+  response.end(status === 204 ? undefined : JSON.stringify(body));
+}
+
+const server = http.createServer((request, response) => {
+  const url = new URL(request.url, 'http://counter');
+  const origin = request.headers.origin || '';
+
+  if (request.method === 'OPTIONS' && url.pathname === '/heartbeat') {
+    return sendJson(response, 204, {}, origin);
+  }
+  if (request.method === 'GET' && url.pathname === '/healthz') {
+    return sendJson(response, 200, { ok: true }, origin);
+  }
+  if (request.method === 'GET' && url.pathname === '/count') {
+    pruneViewers();
+    const embedUrls = new Map();
+    for (const viewer of viewers.values()) {
+      embedUrls.set(viewer.embedUrl, (embedUrls.get(viewer.embedUrl) || 0) + 1);
+    }
+    return sendJson(response, 200, {
+      concurrentViewers: viewers.size,
+      embedUrls: [...embedUrls]
+        .map(([url, views]) => ({ url, views }))
+        .sort((a, b) => b.views - a.views || a.url.localeCompare(b.url)),
+      heartbeatIntervalSeconds: heartbeatIntervalMs / 1000,
+      activeWindowSeconds: viewerTtlMs / 1000
+    }, origin);
+  }
+  if (request.method !== 'POST' || url.pathname !== '/heartbeat') {
+    return sendJson(response, 404, { error: 'Not found' }, origin);
+  }
+
+  let body = '';
+  request.setEncoding('utf8');
+  request.on('data', (chunk) => {
+    body += chunk;
+    if (Buffer.byteLength(body) > maxBodyBytes) request.destroy();
+  });
+  request.on('end', () => {
+    try {
+      const { viewerId, embedUrl } = JSON.parse(body);
+      if (typeof viewerId !== 'string' || !uuid.test(viewerId)) {
+        return sendJson(response, 400, { error: 'A valid viewerId is required' }, origin);
+      }
+      pruneViewers();
+      viewers.set(viewerId, { lastSeen: Date.now(), embedUrl: normaliseEmbedUrl(embedUrl) });
+      return sendJson(response, 204, {}, origin);
+    } catch {
+      return sendJson(response, 400, { error: 'Invalid JSON' }, origin);
+    }
+  });
+});
+
+setInterval(pruneViewers, heartbeatIntervalMs).unref();
+server.listen(port, '127.0.0.1', () => console.log(`viewer-count listening on ${port}`));
+```
+
+Create `/opt/viewer-count/Dockerfile` with the same contents as the following, then create `/opt/viewer-count/docker-compose.yml`:
+
+```dockerfile
+FROM node:22-alpine
+WORKDIR /app
+COPY server.js ./
+USER node
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+```yaml
+services:
+  viewer-count:
+    build: .
+    restart: unless-stopped
+    network_mode: host
+```
+
+Start and test the service:
+
+```bash
+cd /opt/viewer-count
+sudo docker compose up -d --build
+curl -i http://127.0.0.1:3000/healthz
+sudo ss -ltnp | grep ':3000'
+```
+
+Port 3000 must listen only on `127.0.0.1`.
+
+The service must provide these endpoints:
+
+| Endpoint | Access | Purpose |
+|---|---|---|
+| `OPTIONS /heartbeat` | Player origins | CORS preflight; return `204`. |
+| `POST /heartbeat` | Player origins | Validate the UUID and refresh its 90-second TTL. |
+| `GET /count` | Authenticated operator only | Return the active count and per-referrer totals. |
+| `GET /healthz` | Monitoring or private network | Return a basic health response. |
+
+Use a process supervisor such as systemd or Docker restart policy. Store viewer state in memory for one counter instance, or use Redis with a TTL if the service will run on more than one instance. Do not trust the browser-provided viewer ID for entitlement, billing, or fraud prevention.
+
+The complete `server.js` above includes CORS handling and returns `204` for `OPTIONS /heartbeat`. It allowlists only `https://player01.cockxing.online`; never change this to `*`. Keep `GET /count` protected by dashboard authentication and never allow public access to it.
+
+Create a bcrypt hash with `sudo caddy hash-password`, replace `PASTE_BCRYPT_HASH`, and use this Caddyfile on the counter server:
+
+```caddyfile
+count.cockxing.online {
+    handle_path /dashboard/* {
+        basic_auth {
+            operator PASTE_BCRYPT_HASH
+        }
+        root * /srv/viewer-dashboard
+        file_server
+    }
+    handle /count {
+        basic_auth {
+            operator PASTE_BCRYPT_HASH
+        }
+        reverse_proxy 127.0.0.1:3000
+    }
+    handle /heartbeat {
+        reverse_proxy 127.0.0.1:3000
+    }
+    handle /healthz {
+        reverse_proxy 127.0.0.1:3000
+    }
+    respond 404
+}
+```
+
+Create `/srv/viewer-dashboard/index.html`:
+
+```html
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live stream operations</title>
+<body>
+  <h1>Live stream operations</h1>
+  <p id="count">Loading...</p>
+  <pre id="details"></pre>
+  <script>
+    async function refresh() {
+      const count = document.querySelector('#count');
+      const details = document.querySelector('#details');
+      try {
+        const response = await fetch('/count', { cache: 'no-store' });
+        if (!response.ok) throw new Error('Request failed: ' + response.status);
+        const data = await response.json();
+        count.textContent = data.concurrentViewers + ' active player sessions';
+        details.textContent = JSON.stringify(data.embedUrls, null, 2);
+      } catch (error) {
+        count.textContent = 'Viewer count unavailable';
+        details.textContent = error.message;
+      }
+    }
+    refresh();
+    setInterval(refresh, 30_000);
+  </script>
+</body>
+</html>
+```
+
+Create the directory, reload Caddy, and test:
+
+```bash
+sudo install -d -m 755 /srv/viewer-dashboard
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+curl -i https://count.cockxing.online/healthz
+curl -i -X OPTIONS https://count.cockxing.online/heartbeat \
+  -H 'Origin: https://player01.cockxing.online' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: content-type'
+```
+
+Expected results are `200` for health and `204` for preflight with `Access-Control-Allow-Origin: https://player01.cockxing.online`. Open `https://count.cockxing.online/dashboard/` and confirm it prompts for `operator` credentials.
+
+Before putting it in service, test the external server locally and through HTTPS:
+
+```bash
+curl -i https://count.cockxing.online/healthz
+curl -i -X OPTIONS https://count.cockxing.online/heartbeat \
+  -H 'Origin: https://stream.v3stech.online' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: content-type'
+```
+
+The first request should return `200`. The preflight should return `204` and include `Access-Control-Allow-Origin` for the supplied origin. Do not test `/count` without authentication in a production environment.
+
+### 11.2 Point the player at the separate server
+
+**Location: Origin SSH terminal. File: `~/ome/player/index.html`**
+
+Immediately after the existing `const retryDelayMs = 10000;` line, add the following, using the exact external URL:
+
+```js
+  const viewerIdKey = 'omeViewerId';
+  const viewerId = sessionStorage.getItem(viewerIdKey) || crypto.randomUUID();
+  const viewerHeartbeatUrl = 'https://count.cockxing.online/heartbeat';
+  const viewerHeartbeatMs = 30_000;
+  let viewerTimer;
+```
+
+Before `function startStream()`, add:
+
+```js
+    function sendViewerHeartbeat() {
+      fetch(viewerHeartbeatUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ viewerId, embedUrl: document.referrer }),
+        keepalive: true
+      }).catch(function () {});
+    }
+
+    function startViewerTracking() {
+      if (viewerTimer) return;
+      sessionStorage.setItem(viewerIdKey, viewerId);
+      sendViewerHeartbeat();
+      viewerTimer = setInterval(sendViewerHeartbeat, viewerHeartbeatMs);
+    }
+
+    function stopViewerTracking() {
+      clearInterval(viewerTimer);
+      viewerTimer = undefined;
+    }
+```
+
+Add `startViewerTracking();` as the final statement in `showLive()` and `stopViewerTracking();` as the first statement in `handleStreamOffline()`. Do not route video through `count.cockxing.online`; only the heartbeat uses it.
+
+After deployment, the player DevTools Network panel should show an `OPTIONS` request followed by `POST /heartbeat` with a successful `204` response. A missing request means tracking did not start; a CORS error means the player origin is not allowlisted; a `401` or `403` means counter authentication or the proxy is blocking a player request. The request may contain the parent page in `document.referrer` when the browser supplies it, but referrer data can be reduced or omitted.
+
+Do not add the external counter hostname as a Bunny Pull Zone hostname unless you intentionally want Bunny to proxy the counter. Direct HTTPS to the separate server is simpler and keeps counter requests out of video CDN routing. If the counter server is later unavailable, the player should continue playing; heartbeat failures must be caught and must never block HLS playback.
+
+If an old local counter was previously installed, remove it while applying these two subsections: delete the local heartbeat/API/dashboard handlers from the origin Caddyfile, remove the `viewer-count` service and dashboard volume from Compose, stop the old container, and delete the old `~/ome/viewer-count` and `~/ome/viewer-dashboard` directories. Delete or disable Bunny Edge Rules for `*/viewer-api/*` and `*/viewer-dashboard/*` when those paths are no longer served through the streaming hostname. Keep the normal player and media caching rules.
+
+Bunny analytics remains available for request, bandwidth, and delivery metrics. The external counter is only for an operational active-session estimate.
+
+The old same-origin implementation is removed from this guide. Use only the separate-server service and the external heartbeat URL described in 11.1 and 11.2.
+
+<!-- Retired same-origin counter material removed from the rendered guide.
 
 | File | Purpose |
 |---|---|
@@ -971,9 +1273,9 @@ An embedded player is counted too: the heartbeat code runs inside `~/ome/player/
 
 The operator must still authenticate to the dashboard. A customer-facing page must not embed the dashboard or call its API.
 
-### Historical reference only - retired service files
+### Retired reference only - do not deploy on any streaming origin
 
-**Location: Origin SSH terminal. Working directory: `~/ome`**
+**Location: retired example only; use the separate counter server instructions above**
 
 Create the directory and service file:
 
@@ -1089,9 +1391,9 @@ EXPOSE 3000
 CMD ["node", "server.js"]
 ```
 
-### Historical reference only - retired Caddy and Compose routes
+### Retired reference only - do not add these Caddy or Compose routes
 
-**Location: Origin SSH terminal. Working directory: `~/ome`**
+**Location: retired example only; do not apply to the streaming origin**
 
 Create a bcrypt password hash for the operator dashboard. Keep the password in a password manager; only the hash is placed in Caddy's configuration. Run this interactively and enter the same password when prompted twice; nothing is displayed while typing.
 
@@ -1194,9 +1496,9 @@ sudo docker compose logs --tail=50 viewer-count caddy
 
 Expected result: `viewer-count` and `caddy` show `running`, the viewer-count log says `viewer-count listening on 3000`, and the Caddy log has no configuration or upstream errors. If the dashboard directory was missing, the `install -d` command above prevents Docker from creating it with the wrong type or ownership.
 
-### Historical reference only - retired player heartbeat and dashboard
+### Retired reference only - use the external heartbeat URL above
 
-**Location: Origin SSH terminal. File: `~/ome/player/index.html`**
+**Location: retired example only; do not restore the old same-origin routes**
 
 Add the following constants immediately after the existing `const retryDelayMs = 10000;` line:
 
@@ -1324,6 +1626,7 @@ The in-memory map resets to zero when the `viewer-count` container restarts. Tha
 
 For a private or paid stream, integrate the heartbeat with the same server-side viewer authentication used to issue Bunny directory tokens in section 12. Require a valid authenticated session before accepting `/heartbeat`, and derive the viewer key from the authenticated account/session rather than trusting the browser-provided ID. Do not expose this lightweight counter as an anti-fraud or entitlement system.
 
+-->
 ## 12. Phase 7 - Secure a stream embedded on another website
 
 Signed URLs are the access control. CORS only permits browser JavaScript to read cross-origin media responses; it does not stop someone from copying an otherwise public URL.
@@ -1427,7 +1730,7 @@ Complete these checks before calling the stream ready:
 - [ ] Playlist and media requests use `player01`, not the origin hostname.
 - [ ] `.m3u8` is not cached; `.m4s` has the intended TTL.
 - [ ] If protected, a valid short-lived token plays and an expired/missing token fails.
-- [ ] The retired concurrent-viewer counter is removed from the player, Compose, Caddy, and Bunny configuration.
+- [ ] If used, the concurrent-viewer counter runs on a separate HTTPS server; the streaming origin has no counter service or counter routes.
 - [ ] If embedded, every actual website origin is in `<CrossDomains>` and partner playback has no CORS error.
 - [ ] Tests from meaningful audience regions record startup time, rebuffer count, and live latency.
 
